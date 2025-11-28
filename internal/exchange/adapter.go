@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 type BinanceAdapter struct {
 	rest      BinanceREST
 	ws        BinanceWS
+	tradeWS   *TradeWSClient  // WebSocket trading client
 	connected bool
 	mu        sync.RWMutex
 
@@ -28,15 +30,35 @@ type BinanceAdapter struct {
 
 // NewBinanceAdapter creates a new Binance exchange adapter
 func NewBinanceAdapter(rest BinanceREST, ws BinanceWS) *BinanceAdapter {
+	// Initialize WebSocket trading client
+	// Get API keys from REST client if it's BinanceRESTClient
+	apiKey := ""
+	secretKey := ""
+	if restClient, ok := rest.(*BinanceRESTClient); ok {
+		apiKey = restClient.APIKey
+		secretKey = restClient.Secret
+	}
+	
+	tradeWS := NewTradeWSClient(TradeWSConfig{
+		BaseURL:      "wss://ws-fapi.binance.com/ws-fapi/v1",
+		APIKey:       apiKey,
+		SecretKey:    secretKey,
+		AckTimeout:   3 * time.Second,
+		KeepAlive:    15 * time.Second,
+		RetryBackoff: time.Second,
+		MaxRetries:   5,
+	})
+	
 	return &BinanceAdapter{
 		rest:      rest,
 		ws:        ws,
+		tradeWS:   tradeWS,
 		positions: make(map[string]*Position),
 		orders:    make(map[string]*Order),
 	}
 }
 
-// PlaceOrder places a new order
+// PlaceOrder places a new order via REST API (fallback from WSS)
 func (b *BinanceAdapter) PlaceOrder(ctx context.Context, order *Order) (*Order, error) {
 	if order == nil {
 		return nil, ErrInvalidOrder
@@ -47,7 +69,7 @@ func (b *BinanceAdapter) PlaceOrder(ctx context.Context, order *Order) (*Order, 
 		order.ClientOrderID = fmt.Sprintf("phoenix-%s-%d", order.Symbol, time.Now().UnixNano())
 	}
 
-	// Place order via REST
+	// Use REST API as fallback (WSS requires special API key permissions)
 	orderID, err := b.rest.PlaceLimit(
 		order.Symbol,
 		order.Side,
@@ -55,11 +77,22 @@ func (b *BinanceAdapter) PlaceOrder(ctx context.Context, order *Order) (*Order, 
 		order.Price,
 		order.Quantity,
 		false, // reduceOnly
-		true,  // postOnly
+		true,  // postOnly - Maker-only for free fees
 		order.ClientOrderID,
 	)
-	if err != nil {
+	
+	// If Post Only failed with -5022 error (would execute as taker), skip
+	if err != nil && strings.Contains(err.Error(), "-5022") {
+		log.Debug().
+			Str("symbol", order.Symbol).
+			Str("side", order.Side).
+			Float64("price", order.Price).
+			Msg("订单价格过近，跳过Post Only失败的订单(REST)")
 		return nil, err
+	}
+	
+	if err != nil {
+		return nil, fmt.Errorf("rest place order failed: %w", err)
 	}
 
 	// Update order state
@@ -67,7 +100,7 @@ func (b *BinanceAdapter) PlaceOrder(ctx context.Context, order *Order) (*Order, 
 	order.CreatedAt = time.Now()
 
 	b.stateMu.Lock()
-	b.orders[orderID] = order
+	b.orders[order.ClientOrderID] = order
 	b.stateMu.Unlock()
 
 	log.Info().
@@ -76,25 +109,28 @@ func (b *BinanceAdapter) PlaceOrder(ctx context.Context, order *Order) (*Order, 
 		Float64("price", order.Price).
 		Float64("qty", order.Quantity).
 		Str("client_id", order.ClientOrderID).
+		Str("order_id", orderID).
+		Str("channel", "REST").
 		Msg("订单已下达")
 
 	return order, nil
 }
 
-// CancelOrder cancels an existing order
+// CancelOrder cancels an existing order via REST API (fallback from WSS)
 func (b *BinanceAdapter) CancelOrder(ctx context.Context, symbol, clientOrderID string) error {
 	if symbol == "" || clientOrderID == "" {
 		return ErrInvalidOrder
 	}
 
-	err := b.rest.CancelOrder(symbol, clientOrderID)
-	if err != nil {
-		return err
+	// Use REST API as fallback
+	if err := b.rest.CancelOrder(symbol, clientOrderID); err != nil {
+		return fmt.Errorf("rest cancel order failed: %w", err)
 	}
 
 	log.Info().
 		Str("symbol", symbol).
 		Str("client_id", clientOrderID).
+		Str("channel", "REST").
 		Msg("订单已撤销")
 
 	return nil
@@ -234,7 +270,11 @@ func (b *BinanceAdapter) Connect(ctx context.Context) error {
 		return nil
 	}
 
-	// Start WebSocket handler
+	// Start WebSocket trading client
+	b.tradeWS.Start(ctx)
+	log.Info().Msg("WebSocket交易客户端已启动")
+
+	// Start WebSocket handler for market data
 	go func() {
 		handler := &adapterWSHandler{adapter: b}
 		if err := b.ws.Run(handler); err != nil {
@@ -252,6 +292,12 @@ func (b *BinanceAdapter) Connect(ctx context.Context) error {
 func (b *BinanceAdapter) Disconnect() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// Close WebSocket trading client
+	if b.tradeWS != nil {
+		b.tradeWS.Close()
+		log.Info().Msg("WebSocket交易客户端已关闭")
+	}
 
 	b.connected = false
 	log.Info().Msg("Exchange已断开")

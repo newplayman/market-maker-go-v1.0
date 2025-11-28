@@ -1,0 +1,173 @@
+# Phoenix v2 部署状态报告
+# 生成时间: 2025-11-28 05:04
+
+## 部署完成情况
+
+### 1. 环境清理 ✅
+- 已检查并清理所有残留进程（无残留）
+- 原项目已完整备份至: /root/backup.old/market-maker-go-20251128_050028/
+- 当前工作目录已清空并准备就绪
+
+### 2. 代码部署 ✅
+- 仓库地址: https://github.com/newplayman/market-maker-go-v1.0
+- 克隆完成: /root/market-maker-go
+- 项目版本: Phoenix v2.0.0
+- 提交状态: 最新代码
+
+### 3. 依赖安装 ✅
+- Go版本: 1.23.0
+- 依赖下载: 完成 (go mod download)
+- 编译状态: 成功
+- 可执行文件: /root/market-maker-go/bin/phoenix
+
+### 4. 配置文件 ✅
+- 主配置: /root/market-maker-go/config.yaml (已创建)
+- 配置类型: 实盘生产配置
+- 测试网模式: false (实盘模式)
+- API密钥来源: 环境变量 (BINANCE_API_KEY/BINANCE_API_SECRET)
+
+### 5. 交易配置
+- 交易对: BTCUSDT
+- 最大仓位: 0.01 BTC (~$900)
+- 最小价差: 0.05%
+- 止损阈值: 3%
+- 总风险上限: $1000
+
+### 6. 目录结构 ✅
+- 数据目录: /root/market-maker-go/data/
+- 日志目录: /root/market-maker-go/logs/
+- 运行目录: /root/market-maker-go/run/
+- 可执行文件: /root/market-marker-go/bin/phoenix
+
+### 7. 监控配置 ✅
+- Prometheus端口: 9090
+- 指标端点: http://localhost:9090/metrics
+- 日志级别: info
+- 快照间隔: 60秒
+
+## API配置信息
+
+### 环境变量（已配置）
+- BINANCE_API_KEY: JDTnMB72CIL... (已设置)
+- BINANCE_API_SECRET: RvaTep... (已设置)
+- BINANCE_REST_URL: https://fapi.binance.com (默认)
+- BINANCE_WS_ENDPOINT: wss://fstream.binance.com (默认)
+
+## 启动方式
+
+### 方式1: 直接启动（前台运行）
+```bash
+cd /root/market-maker-go
+./bin/phoenix -config config.yaml -log info
+```
+
+### 方式2: 后台启动（使用脚本）
+```bash
+cd /root/market-maker-go
+bash scripts/start_production.sh
+```
+
+### 方式3: 手动后台启动
+```bash
+cd /root/market-maker-go
+nohup ./bin/phoenix -config config.yaml -log info > logs/phoenix.out 2>&1 &
+echo $! > run/phoenix.pid
+```
+
+## 停止方式
+
+### 优雅停止（推荐）
+```bash
+# 按Ctrl+C停止前台进程
+# 或者
+kill -TERM $(cat /root/market-maker-go/run/phoenix.pid)
+```
+
+### 紧急停止（撤单+平仓）
+```bash
+cd /root/market-maker-go
+bash scripts/emergency_stop.sh
+```
+
+## 监控方式
+
+### 查看实时日志
+```bash
+tail -f /root/market-maker-go/logs/phoenix.out
+```
+
+### 查看进程状态
+```bash
+ps aux | grep phoenix
+```
+
+### 查看指标
+```bash
+curl http://localhost:9090/metrics
+```
+
+### 检查进程ID
+```bash
+cat /root/market-maker-go/run/phoenix.pid
+```
+
+## 重要提醒
+
+### 🚨 风险警告
+1. 这是实盘环境，会产生真实盈亏！
+2. 当前配置为小资金测试（最大$1000敞口）
+3. 请密切监控运行状况
+4. 建议设置Prometheus告警
+5. 准备好紧急停止脚本
+
+### 📊 监控重点
+1. 仓位变化 (phoenix_position_net)
+2. 未实现盈亏 (phoenix_unrealized_pnl)
+3. 订单成交情况 (phoenix_fill_count_total)
+4. 风控触发次数 (phoenix_risk_check_failures_total)
+5. API延迟 (phoenix_api_latency_seconds)
+
+### ✅ 建议步骤
+1. 首次启动前，再次确认API密钥权限
+2. 启动后立即检查日志，确认连接正常
+3. 观察前5-10分钟的订单行为
+4. 监控仓位是否符合预期
+5. 如发现异常，立即执行emergency_stop.sh
+
+### 📁 备份位置
+- 旧版本代码: /root/backup.old/market-maker-go-20251128_050028/
+- 旧版本配置: /root/backup.old/market-maker-go-20251128_050028/configs/
+- 旧版本数据: /root/backup.old/market-maker-go-20251128_050028/data/
+
+## 验证清单
+
+- [✅] 进程清理完成
+- [✅] 代码备份完成
+- [✅] 新代码拉取完成
+- [✅] 依赖安装完成
+- [✅] 编译成功
+- [✅] 配置文件创建
+- [✅] API密钥配置（环境变量）
+- [✅] 目录结构准备
+- [✅] 脚本权限设置
+- [⏳] 待启动进行实盘测试
+
+## 下一步操作
+
+准备就绪！可以执行以下命令启动实盘测试：
+
+```bash
+cd /root/market-maker-go
+bash scripts/start_production.sh
+```
+
+或手动启动并观察日志：
+
+```bash
+cd /root/market-maker-go
+./bin/phoenix -config config.yaml -log info
+```
+
+---
+部署完成时间: 2025-11-28 05:04 UTC
+部署状态: ✅ 完成，等待启动
