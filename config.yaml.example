@@ -1,0 +1,85 @@
+global:
+  # 总名义价值上限 (USD)
+  total_notional_max: 100000.0
+  
+  # 报价间隔 (毫秒)
+  quote_interval_ms: 500
+  
+  # Binance API配置
+  api_key: "YOUR_API_KEY"
+  api_secret: "YOUR_API_SECRET"
+  
+  # 是否使用测试网
+  testnet: true
+  
+  # 日志级别 (debug, info, warn, error)
+  log_level: "info"
+  
+  # Prometheus监控端口
+  metrics_port: 9090
+  
+  # 快照文件路径
+  snapshot_path: "./data/snapshot.json"
+  
+  # 快照保存间隔 (秒)
+  snapshot_interval: 60
+
+symbols:
+  - symbol: "ETHUSDC"
+    # 最大净仓位 (手数)
+    net_max: 10.0
+    
+    # 最小价差 (比例)
+    min_spread: 0.0002
+    
+    # 价格最小变动单位
+    tick_size: 0.01
+    
+    # 最小下单量
+    min_qty: 0.01
+    
+    # 基础层级挂单量
+    base_layer_size: 0.1
+    
+    # 近端层数
+    near_layers: 3
+    
+    # 远端层数
+    far_layers: 5
+    
+    # 远端层挂单量
+    far_layer_size: 0.2
+    
+    # 是否启用钉子模式
+    pinning_enabled: true
+    
+    # 钉子模式触发阈值 (净仓/NetMax)
+    pinning_thresh: 0.6
+    
+    # 是否启用磨仓模式
+    grinding_enabled: true
+    
+    # 磨仓触发阈值
+    grinding_thresh: 0.4
+    
+    # 止损阈值 (回撤%)
+    stop_loss_thresh: 0.05
+    
+    # 每分钟最大撤单数
+    max_cancel_per_min: 50
+
+  - symbol: "BTCUSDC"
+    net_max: 0.5
+    min_spread: 0.0002
+    tick_size: 0.1
+    min_qty: 0.001
+    base_layer_size: 0.01
+    near_layers: 3
+    far_layers: 5
+    far_layer_size: 0.02
+    pinning_enabled: true
+    pinning_thresh: 0.6
+    grinding_enabled: true
+    grinding_thresh: 0.4
+    stop_loss_thresh: 0.05
+    max_cancel_per_min: 50

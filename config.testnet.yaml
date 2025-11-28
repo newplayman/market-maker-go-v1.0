@@ -1,0 +1,80 @@
+# Phoenix v2 测试网配置
+# 请填入你的Binance测试网API密钥后使用
+
+global:
+  # ==================== API配置 ====================
+  # 请在下方填入你的测试网API密钥
+  api_key: "IkgAqJvn63AQAPanHPjAB81N1waP681e6yVn11sPBx7jUGYzndHLRZRScLyKNMQD"        # 替换为你的测试网API Key
+  api_secret: "gCE1rSOPHmw7EyNVUCwNBNWN0hEbsaVzzfweMFbGIPbnfSSBRbtGIrd3XUKuAnla"  # 替换为你的测试网API Secret
+  
+  # ==================== 网络配置 ====================
+  testnet: true                          # 测试网模式（不要改动）
+  
+  # ==================== 风控配置 ====================
+  total_notional_max: 10000.0           # 总名义价值上限 $10,000 (测试网)
+  
+  # ==================== 报价配置 ====================
+  quote_interval_ms: 1000               # 报价间隔 1000ms (测试用)
+  
+  # ==================== 监控配置 ====================
+  metrics_port: 9090                    # Prometheus监控端口
+  
+  # ==================== 持久化配置 ====================
+  snapshot_path: "./data/snapshot_testnet.json"  # 测试网快照路径
+  snapshot_interval: 60                          # 快照间隔60秒
+
+# ==================== 交易对配置 ====================
+# 测试配置：使用单个交易对，小仓位
+symbols:
+  - symbol: "BTCUSDT"                   # 交易对
+    
+    # 仓位限制（测试网使用小仓位）
+    net_max: 0.15                       # 最大净仓位 0.15 BTC
+    
+    # 价差配置
+    min_spread: 0.0005                  # 最小价差 0.05%
+    
+    # 价格和数量精度
+    tick_size: 0.1                      # 价格最小变动 $0.1
+    min_qty: 0.001                      # 最小下单量 0.001 BTC
+    
+    # 挂单配置
+    base_layer_size: 0.001              # 基础层级挂单量 0.001 BTC
+    near_layers: 3                      # 近端层数 3层
+    far_layers: 3                       # 远端层数 3层
+    
+    # 钉子模式（主动平仓）
+    pinning_enabled: true               # 启用钉子模式
+    pinning_thresh: 0.6                 # 触发阈值 60%
+    
+    # 磨仓模式（被动平仓）
+    grinding_enabled: true              # 启用磨仓模式
+    grinding_thresh: 0.4                # 触发阈值 40%
+    
+    # 止损配置
+    stop_loss_thresh: 0.05              # 止损阈值 5%
+    
+    # 撤单限制
+    max_cancel_per_min: 50              # 每分钟最大撤单数
+    
+    # 价格偏移（ASMM策略参数）
+    skew_factor: 1.0                    # 偏移因子
+
+# ==================== 如何使用 ====================
+# 1. 将上面的 YOUR_TESTNET_API_KEY 和 YOUR_TESTNET_API_SECRET 替换为你的真实密钥
+# 2. 运行命令: ./bin/phoenix -config config.testnet.yaml -log info
+# 3. 观察日志输出，查看系统运行情况
+# 4. 访问 http://localhost:9090/metrics 查看监控指标
+#
+# ==================== 测试网信息 ====================
+# Web界面: https://testnet.binancefuture.com
+# 特点:
+#   - 使用虚拟资金，无真实风险
+#   - API与生产环境完全兼容
+#   - 适合测试策略和参数调优
+#
+# ==================== 注意事项 ====================
+# - 这是测试网配置，仓位很小，适合初次测试
+# - 确认系统运行正常后，可以逐步增加仓位
+# - 观察日志中的订单、成交、仓位变化
+# - 如果有问题，按 Ctrl+C 停止系统
