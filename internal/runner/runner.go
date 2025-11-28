@@ -9,6 +9,7 @@ import (
 	"github.com/newplayman/market-maker-phoenix/internal/config"
 	gateway "github.com/newplayman/market-maker-phoenix/internal/exchange"
 	"github.com/newplayman/market-maker-phoenix/internal/metrics"
+	"github.com/newplayman/market-maker-phoenix/internal/order"
 	"github.com/newplayman/market-maker-phoenix/internal/risk"
 	"github.com/newplayman/market-maker-phoenix/internal/store"
 	"github.com/newplayman/market-maker-phoenix/internal/strategy"
@@ -22,6 +23,8 @@ type Runner struct {
 	strategy strategy.Strategy
 	risk     *risk.RiskManager
 	exchange gateway.Exchange
+	om       *order.OrderManager
+	dryRun   bool
 
 	wg       sync.WaitGroup
 	stopChan chan struct{}
@@ -37,12 +40,14 @@ func NewRunner(
 	riskMgr *risk.RiskManager,
 	exch gateway.Exchange,
 ) *Runner {
+	om := order.NewOrderManager(st, exch)
 	return &Runner{
 		cfg:      cfg,
 		store:    st,
 		strategy: strat,
 		risk:     riskMgr,
 		exchange: exch,
+		om:       om,
 		stopChan: make(chan struct{}),
 	}
 }
@@ -153,6 +158,27 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 		metrics.QuoteGeneration.WithLabelValues(symbol).Observe(duration)
 	}()
 
+	// 订单溢出熔断阈值
+	const orderOverflowThreshold = 50
+
+	// 读取当前活跃订单数量
+	activeOrdersCount := r.store.GetActiveOrderCount(symbol)
+
+	if activeOrdersCount > orderOverflowThreshold {
+		log.Error().
+			Str("symbol", symbol).
+			Int("active_orders", activeOrdersCount).
+			Msg("订单数量溢出，进行紧急撤单和熔断")
+
+		// 调用交易所撤销所有订单
+		if err := r.exchange.CancelAllOrders(ctx, symbol); err != nil {
+			log.Error().Err(err).Str("symbol", symbol).Msg("紧急撤单失败")
+		}
+
+		// 停止该策略的做市循环 (返回错误停止本轮交易)
+		return fmt.Errorf("订单数量溢出(%d)，触发紧急撤单", activeOrdersCount)
+	}
+
 	// 1. 检查止损
 	if shouldStop, reason := r.risk.CheckStopLoss(symbol); shouldStop {
 		log.Warn().
@@ -185,40 +211,77 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 		}
 	}
 
-	// 5. 取消旧订单
-	if err := r.exchange.CancelAllOrders(ctx, symbol); err != nil {
-		log.Error().Err(err).Str("symbol", symbol).Msg("取消订单失败")
-	}
-
-	// 6. 下买单
+	// 5. 转换为exchange.Order并进行Pre-Trade风控校验
+	desiredBuyOrders := make([]*gateway.Order, 0, len(buyQuotes))
 	for _, quote := range buyQuotes {
-		order := &gateway.Order{
+		// Pre-Trade风控检查：每个买单都需要通过风控校验
+		if err := r.risk.CheckPreTrade(symbol, "BUY", quote.Size); err != nil {
+			log.Warn().
+				Err(err).
+				Str("symbol", symbol).
+				Float64("size", quote.Size).
+				Float64("price", quote.Price).
+				Msg("买单未通过风控校验，跳过此单")
+			continue
+		}
+		desiredBuyOrders = append(desiredBuyOrders, &gateway.Order{
 			Symbol:   symbol,
 			Side:     "BUY",
 			Type:     "LIMIT",
 			Quantity: quote.Size,
 			Price:    quote.Price,
-		}
-		if _, err := r.exchange.PlaceOrder(ctx, order); err != nil {
-			log.Error().Err(err).Str("symbol", symbol).Msg("下买单失败")
-			metrics.RecordError("place_buy_order", symbol)
-		}
+		})
 	}
 
-	// 7. 下卖单
+	desiredSellOrders := make([]*gateway.Order, 0, len(sellQuotes))
 	for _, quote := range sellQuotes {
-		order := &gateway.Order{
+		// Pre-Trade风控检查：每个卖单都需要通过风控校验
+		if err := r.risk.CheckPreTrade(symbol, "SELL", quote.Size); err != nil {
+			log.Warn().
+				Err(err).
+				Str("symbol", symbol).
+				Float64("size", quote.Size).
+				Float64("price", quote.Price).
+				Msg("卖单未通过风控校验，跳过此单")
+			continue
+		}
+		desiredSellOrders = append(desiredSellOrders, &gateway.Order{
 			Symbol:   symbol,
 			Side:     "SELL",
 			Type:     "LIMIT",
 			Quantity: quote.Size,
 			Price:    quote.Price,
-		}
-		if _, err := r.exchange.PlaceOrder(ctx, order); err != nil {
-			log.Error().Err(err).Str("symbol", symbol).Msg("下卖单失败")
-			metrics.RecordError("place_sell_order", symbol)
+		})
+	}
+
+	// 6. 同步当前本地订单状态（从exchange拉取）
+	if err := r.om.SyncActiveOrders(ctx, symbol); err != nil {
+		log.Error().Err(err).Str("symbol", symbol).Msg("同步活跃订单失败")
+		return err
+	}
+
+	// 7. 计算订单差分，获取待撤销和待新增订单
+	toCancel, toPlace := r.om.CalculateOrderDiff(symbol, desiredBuyOrders, desiredSellOrders)
+
+	// 8. 应用差分，执行撤单和新单下单
+	if r.dryRun {
+		log.Info().
+			Str("symbol", symbol).
+			Int("to_cancel", len(toCancel)).
+			Int("to_place", len(toPlace)).
+			Msg("[Dry-Run模式] 模拟执行订单差分操作，未实际下单")
+	} else {
+		if err := r.om.ApplyDiff(ctx, symbol, toCancel, toPlace); err != nil {
+			log.Error().Err(err).Str("symbol", symbol).Msg("应用订单差分失败")
+			return err
 		}
 	}
+
+	log.Debug().
+		Str("symbol", symbol).
+		Int("to_cancel", len(toCancel)).
+		Int("to_place", len(toPlace)).
+		Msg("订单差分处理完成")
 
 	log.Debug().
 		Str("symbol", symbol).

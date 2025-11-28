@@ -23,7 +23,6 @@ func NewRiskManager(cfg *config.Config, st *store.Store) *RiskManager {
 	}
 }
 
-// CheckPreTrade 交易前风控检查
 func (r *RiskManager) CheckPreTrade(symbol string, side string, size float64) error {
 	symCfg := r.cfg.GetSymbolConfig(symbol)
 	if symCfg == nil {
@@ -40,7 +39,7 @@ func (r *RiskManager) CheckPreTrade(symbol string, side string, size float64) er
 		return fmt.Errorf("订单量 %.4f 小于最小值 %.4f", size, symCfg.MinQty)
 	}
 
-	// 2. 检查净仓位限制
+	// 2. 检查净仓位限制，并区分开仓和平仓
 	state.Mu.RLock()
 	currentPos := state.Position.Size
 	state.Mu.RUnlock()
@@ -52,8 +51,13 @@ func (r *RiskManager) CheckPreTrade(symbol string, side string, size float64) er
 		newPos = currentPos - size
 	}
 
+	// 允许减仓单超过限制，但禁止开仓单超过限制，避免死锁
 	if math.Abs(newPos) > symCfg.NetMax {
-		return fmt.Errorf("净仓位 %.4f 超过限制 %.4f", math.Abs(newPos), symCfg.NetMax)
+		if (side == "BUY" && newPos > currentPos) || (side == "SELL" && newPos < currentPos) {
+			// 这是开仓方向，拒绝
+			return fmt.Errorf("净仓位 %.4f 超过限制 %.4f (开仓被拒绝)", math.Abs(newPos), symCfg.NetMax)
+		}
+		// 减仓方向允许通过
 	}
 
 	// 3. 检查最坏情况敞口

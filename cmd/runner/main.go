@@ -28,6 +28,22 @@ var (
 func main() {
 	flag.Parse()
 
+	// 单实例锁实现，防止多进程启动
+	lockFile := "/tmp/phoenix_runner.lock"
+	lock, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		log.Fatal().Err(err).Msg("创建锁文件失败")
+	}
+	err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		log.Fatal().Msg("已有一个Phoenix进程在运行")
+	}
+	defer func() {
+		syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		lock.Close()
+		os.Remove(lockFile)
+	}()
+
 	// 设置日志
 	setupLogger(*logLevel)
 

@@ -53,7 +53,6 @@ type SymbolState struct {
 	LastCancelReset time.Time
 }
 
-// Store 全局状态存储
 type Store struct {
 	mu              sync.RWMutex
 	symbols         map[string]*SymbolState
@@ -62,6 +61,25 @@ type Store struct {
 	snapshotTicker  *time.Ticker
 	stopSnapshot    chan struct{}
 	lastSnapshotErr error
+}
+
+// GetActiveOrderCount 获取指定符号当前活跃订单数量
+func (s *Store) GetActiveOrderCount(symbol string) int {
+	s.mu.RLock()
+	state, exists := s.symbols[symbol]
+	s.mu.RUnlock()
+
+	if !exists || state == nil {
+		return 0
+	}
+
+	state.Mu.RLock()
+	defer state.Mu.RUnlock()
+
+	// 挂买单量 + 挂卖单量 作为活跃订单指标的近似（也可以改成订单列表长度统计）
+	// 这里按挂单量简单估计，若需要精确以订单Id列表实现。
+	activeCount := int(state.PendingBuy + state.PendingSell)
+	return activeCount
 }
 
 // NewStore 创建新的存储实例

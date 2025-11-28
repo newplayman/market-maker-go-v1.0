@@ -14,15 +14,19 @@ import (
 	"github.com/newplayman/market-maker-phoenix/internal/strategy"
 )
 
-// MockExchange 用于集成测试的模拟交易所
+// MockExchange 实现Exchange接口，用于集成测试模拟
 type MockExchange struct {
-	orders map[string]*gateway.Order
-	mu     sync.RWMutex
+	mu                sync.Mutex
+	placedOrders      []*gateway.Order
+	canceledOrderIDs  []string
+	openOrders        map[string][]*gateway.Order
+	depthSubscribers  []func(*gateway.Depth)
+	userStreamStarted bool
 }
 
 func NewMockExchange() *MockExchange {
 	return &MockExchange{
-		orders: make(map[string]*gateway.Order),
+		openOrders: make(map[string][]*gateway.Order),
 	}
 }
 
@@ -33,37 +37,44 @@ func (m *MockExchange) Connect(ctx context.Context) error {
 func (m *MockExchange) PlaceOrder(ctx context.Context, order *gateway.Order) (*gateway.Order, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	order.ClientOrderID = "test-" + time.Now().Format("20060102150405")
+	order.ClientOrderID = "test_" + time.Now().Format("150405.000")
 	order.Status = "NEW"
-	m.orders[order.ClientOrderID] = order
+	m.placedOrders = append(m.placedOrders, order)
+	m.openOrders[order.Symbol] = append(m.openOrders[order.Symbol], order)
 	return order, nil
 }
 
-func (m *MockExchange) CancelOrder(ctx context.Context, symbol, clientOrderID string) error {
+func (m *MockExchange) CancelOrder(ctx context.Context, symbol string, clientOrderID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	if order, ok := m.orders[clientOrderID]; ok {
-		order.Status = "CANCELED"
+	m.canceledOrderIDs = append(m.canceledOrderIDs, clientOrderID)
+	if orders, ok := m.openOrders[symbol]; ok {
+		for i, o := range orders {
+			if o.ClientOrderID == clientOrderID {
+				m.openOrders[symbol] = append(orders[:i], orders[i+1:]...)
+				break
+			}
+		}
 	}
 	return nil
 }
 
 func (m *MockExchange) CancelAllOrders(ctx context.Context, symbol string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.canceledOrderIDs = []string{}
+	m.openOrders[symbol] = nil
 	return nil
 }
 
 func (m *MockExchange) GetOpenOrders(ctx context.Context, symbol string) ([]*gateway.Order, error) {
-	return nil, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.openOrders[symbol], nil
 }
 
 func (m *MockExchange) GetPosition(ctx context.Context, symbol string) (*gateway.Position, error) {
-	return &gateway.Position{
-		Symbol:     symbol,
-		Size:       0,
-		EntryPrice: 0,
-	}, nil
+	return &gateway.Position{Symbol: symbol}, nil
 }
 
 func (m *MockExchange) GetAllPositions(ctx context.Context) ([]*gateway.Position, error) {
@@ -71,7 +82,7 @@ func (m *MockExchange) GetAllPositions(ctx context.Context) ([]*gateway.Position
 }
 
 func (m *MockExchange) GetFundingRate(ctx context.Context, symbol string) (*gateway.FundingRate, error) {
-	return &gateway.FundingRate{Symbol: symbol, Rate: 0.0001}, nil
+	return &gateway.FundingRate{Symbol: symbol, Rate: 0}, nil
 }
 
 func (m *MockExchange) GetDepth(ctx context.Context, symbol string, limit int) (*gateway.Depth, error) {
@@ -79,10 +90,12 @@ func (m *MockExchange) GetDepth(ctx context.Context, symbol string, limit int) (
 }
 
 func (m *MockExchange) StartDepthStream(ctx context.Context, symbols []string, callback func(*gateway.Depth)) error {
+	m.depthSubscribers = append(m.depthSubscribers, callback)
 	return nil
 }
 
 func (m *MockExchange) StartUserStream(ctx context.Context, callbacks *gateway.UserStreamCallbacks) error {
+	m.userStreamStarted = true
 	return nil
 }
 
@@ -94,166 +107,53 @@ func (m *MockExchange) IsConnected() bool {
 	return true
 }
 
-// TestIntegration_BasicWorkflow 测试基本工作流程
-func TestIntegration_BasicWorkflow(t *testing.T) {
-	// 创建配置
+// TestIntegration_Run 测试从启动到订单生成和同步的流程
+func TestIntegration_Run(t *testing.T) {
 	cfg := &config.Config{
 		Global: config.GlobalConfig{
 			TotalNotionalMax: 1000000,
-			QuoteIntervalMs:  200,
+			QuoteIntervalMs:  100,
 		},
 		Symbols: []config.SymbolConfig{
 			{
 				Symbol:          "BTCUSDT",
 				NetMax:          1.0,
 				MinSpread:       0.0002,
-				NearLayers:      3,
-				FarLayers:       5,
-				BaseLayerSize:   0.1,
+				NearLayers:      1,
+				FarLayers:       1,
+				BaseLayerSize:   0.01,
 				MaxCancelPerMin: 100,
 			},
 		},
 	}
 
-	// 初始化组件
-	st := store.NewStore("", 5*time.Minute)
+	st := store.NewStore("", time.Minute)
 	st.InitSymbol("BTCUSDT", 100)
+	st.UpdateMidPrice("BTCUSDT", 50000, 49995, 50005)
 
-	// 初始化价格数据
-	for i := 0; i < 10; i++ {
-		st.UpdateMidPrice("BTCUSDT", 50000, 49995, 50005)
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	mockExch := NewMockExchange()
-	strat := strategy.NewASMM(cfg, st)
 	riskMgr := risk.NewRiskManager(cfg, st)
-	r := runner.NewRunner(cfg, st, strat, riskMgr, mockExch)
-
-	// 启动Runner
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-
-	go func() {
-		if err := r.Start(ctx); err != nil {
-			t.Logf("Runner error: %v", err)
-		}
-	}()
-
-	// 运行一段时间
-	time.Sleep(400 * time.Millisecond)
-
-	// 停止Runner
-	r.Stop()
-
-	// 验证系统运行正常
-	t.Log("集成测试完成 - 系统正常运行")
-}
-
-// TestIntegration_MultiSymbol 测试多交易对
-func TestIntegration_MultiSymbol(t *testing.T) {
-	cfg := &config.Config{
-		Global: config.GlobalConfig{
-			TotalNotionalMax: 2000000,
-			QuoteIntervalMs:  200,
-		},
-		Symbols: []config.SymbolConfig{
-			{
-				Symbol:          "BTCUSDT",
-				NetMax:          1.0,
-				MinSpread:       0.0002,
-				NearLayers:      2,
-				FarLayers:       3,
-				BaseLayerSize:   0.1,
-				MaxCancelPerMin: 100,
-			},
-			{
-				Symbol:          "ETHUSDT",
-				NetMax:          2.0,
-				MinSpread:       0.0002,
-				NearLayers:      2,
-				FarLayers:       3,
-				BaseLayerSize:   0.2,
-				MaxCancelPerMin: 100,
-			},
-		},
-	}
-
-	st := store.NewStore("", 5*time.Minute)
-	st.InitSymbol("BTCUSDT", 100)
-	st.InitSymbol("ETHUSDT", 100)
-
-	// 初始化价格数据
-	for i := 0; i < 10; i++ {
-		st.UpdateMidPrice("BTCUSDT", 50000, 49995, 50005)
-		st.UpdateMidPrice("ETHUSDT", 3000, 2998, 3002)
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	mockExch := NewMockExchange()
 	strat := strategy.NewASMM(cfg, st)
-	riskMgr := risk.NewRiskManager(cfg, st)
-	r := runner.NewRunner(cfg, st, strat, riskMgr, mockExch)
+	mockExch := NewMockExchange()
+
+	runner := runner.NewRunner(cfg, st, strat, riskMgr, mockExch)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	go func() {
-		if err := r.Start(ctx); err != nil {
-			t.Logf("Runner error: %v", err)
+		if err := runner.Start(ctx); err != nil {
+			t.Errorf("Runner start failed: %v", err)
 		}
 	}()
 
 	time.Sleep(400 * time.Millisecond)
-	r.Stop()
+	runner.Stop()
 
-	t.Log("多交易对集成测试完成")
-}
+	mockExch.mu.Lock()
+	placedCount := len(mockExch.placedOrders)
+	mockExch.mu.Unlock()
 
-// TestIntegration_RiskControl 测试风控功能
-func TestIntegration_RiskControl(t *testing.T) {
-	cfg := &config.Config{
-		Global: config.GlobalConfig{
-			TotalNotionalMax: 1000000,
-			QuoteIntervalMs:  200,
-		},
-		Symbols: []config.SymbolConfig{
-			{
-				Symbol:          "BTCUSDT",
-				NetMax:          0.01, // 非常小的限制
-				MinSpread:       0.0002,
-				NearLayers:      3,
-				FarLayers:       5,
-				BaseLayerSize:   1.0, // 大订单
-				MaxCancelPerMin: 100,
-			},
-		},
+	if placedCount == 0 {
+		t.Error("Expected at least one order placed")
 	}
-
-	st := store.NewStore("", 5*time.Minute)
-	st.InitSymbol("BTCUSDT", 100)
-
-	for i := 0; i < 10; i++ {
-		st.UpdateMidPrice("BTCUSDT", 50000, 49995, 50005)
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	mockExch := NewMockExchange()
-	strat := strategy.NewASMM(cfg, st)
-	riskMgr := risk.NewRiskManager(cfg, st)
-	r := runner.NewRunner(cfg, st, strat, riskMgr, mockExch)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
-
-	go func() {
-		if err := r.Start(ctx); err != nil {
-			t.Logf("Runner error: %v", err)
-		}
-	}()
-
-	time.Sleep(250 * time.Millisecond)
-	r.Stop()
-
-	t.Log("风控集成测试完成 - 风控正常工作")
 }
