@@ -30,21 +30,42 @@ type GlobalConfig struct {
 
 // SymbolConfig 单个交易对配置
 type SymbolConfig struct {
-	Symbol          string  `mapstructure:"symbol"`             // 交易对符号 (e.g., ETHUSDC)
-	NetMax          float64 `mapstructure:"net_max"`            // 最大净仓位 (手数)
-	MinSpread       float64 `mapstructure:"min_spread"`         // 最小价差 (比例)
-	TickSize        float64 `mapstructure:"tick_size"`          // 价格最小变动单位
-	MinQty          float64 `mapstructure:"min_qty"`            // 最小下单量
-	BaseLayerSize   float64 `mapstructure:"base_layer_size"`    // 基础层级挂单量
-	NearLayers      int     `mapstructure:"near_layers"`        // 近端层数
-	FarLayers       int     `mapstructure:"far_layers"`         // 远端层数
-	FarLayerSize    float64 `mapstructure:"far_layer_size"`     // 远端层挂单量
-	PinningEnabled  bool    `mapstructure:"pinning_enabled"`    // 是否启用钉子模式
-	PinningThresh   float64 `mapstructure:"pinning_thresh"`     // 钉子模式触发阈值 (净仓/NetMax)
-	GrindingEnabled bool    `mapstructure:"grinding_enabled"`   // 是否启用磨仓模式
-	GrindingThresh  float64 `mapstructure:"grinding_thresh"`    // 磨仓触发阈值
-	StopLossThresh  float64 `mapstructure:"stop_loss_thresh"`   // 止损阈值 (回撤%)
-	MaxCancelPerMin int     `mapstructure:"max_cancel_per_min"` // 每分钟最大撤单数
+	Symbol           string  `mapstructure:"symbol"`             // 交易对符号 (e.g., ETHUSDC)
+	NetMax           float64 `mapstructure:"net_max"`            // 最大净仓位 (手数)
+	MinSpread        float64 `mapstructure:"min_spread"`         // 最小价差 (比例)
+	TickSize         float64 `mapstructure:"tick_size"`          // 价格最小变动单位
+	MinQty           float64 `mapstructure:"min_qty"`            // 最小下单量
+	BaseLayerSize    float64 `mapstructure:"base_layer_size"`    // 基础层级挂单量（废弃，使用UnifiedLayerSize）
+	NearLayers       int     `mapstructure:"near_layers"`        // 近端层数（废弃，使用TotalLayers）
+	FarLayers        int     `mapstructure:"far_layers"`         // 远端层数（废弃，使用TotalLayers）
+	FarLayerSize     float64 `mapstructure:"far_layer_size"`     // 远端层挂单量（废弃）
+	PinningEnabled   bool    `mapstructure:"pinning_enabled"`    // 是否启用钉子模式
+	PinningThresh    float64 `mapstructure:"pinning_thresh"`     // 钉子模式触发阈值 (净仓/NetMax)
+	GrindingEnabled  bool    `mapstructure:"grinding_enabled"`   // 是否启用磨仓模式
+	GrindingThresh   float64 `mapstructure:"grinding_thresh"`    // 磨仓触发阈值
+	StopLossThresh   float64 `mapstructure:"stop_loss_thresh"`   // 止损阈值 (回撤%)
+	MaxCancelPerMin  int     `mapstructure:"max_cancel_per_min"` // 每分钟最大撤单数
+	LayerSpacingMode string  `mapstructure:"layer_spacing_mode"` // 层间距模式: geometric(几何) | linear(线性)
+	SpacingRatio     float64 `mapstructure:"spacing_ratio"`      // 几何增长公比（废弃，使用GridSpacingMultiplier）
+
+	// 【新增】统一几何网格参数
+	TotalLayers           int     `mapstructure:"total_layers"`            // 总层数（单边，例如18）
+	GridStartOffset       float64 `mapstructure:"grid_start_offset"`       // 第一层距离mid（USDT，例如1.2）
+	GridFirstSpacing      float64 `mapstructure:"grid_first_spacing"`      // 第一层间距（USDT，例如1.2）
+	GridSpacingMultiplier float64 `mapstructure:"grid_spacing_multiplier"` // 几何系数（例如1.15）
+	GridMaxSpacing        float64 `mapstructure:"grid_max_spacing"`        // 最大层间距（USDT，例如25）
+	UnifiedLayerSize      float64 `mapstructure:"unified_layer_size"`      // 统一层大小（ETH，例如0.0067 ≈ 20U @ 3000价格）
+
+	// 近端层级参数 - 实现更紧的盘口报价（废弃，使用统一网格）
+	NearLayerStartOffset  float64 `mapstructure:"near_layer_start_offset"`  // 近端起始偏移 (比例，如0.00033表示0.033%)
+	NearLayerSpacingRatio float64 `mapstructure:"near_layer_spacing_ratio"` // 近端层间距几何公比
+
+	// 远端层级参数 - 实现几何网格（废弃，使用统一网格）
+	FarLayerStartOffset float64 `mapstructure:"far_layer_start_offset"` // 远端起始偏移 (比例)
+	FarLayerEndOffset   float64 `mapstructure:"far_layer_end_offset"`   // 远端结束偏移 (比例)
+
+	// 库存偏移系数 - 增强成交后逼近盘口的效果
+	InventorySkewCoeff float64 `mapstructure:"inventory_skew_coeff"` // 库存偏移系数 (默认0.002)
 }
 
 var (
@@ -115,7 +136,8 @@ func validateConfig(cfg *Config) error {
 		return fmt.Errorf("至少需要配置一个交易对")
 	}
 
-	for i, sym := range cfg.Symbols {
+	for i := range cfg.Symbols {
+		sym := &cfg.Symbols[i] // 使用指针以便修改原始配置
 		if sym.Symbol == "" {
 			return fmt.Errorf("symbols[%d]: symbol 不能为空", i)
 		}
@@ -125,15 +147,85 @@ func validateConfig(cfg *Config) error {
 		if sym.MinSpread <= 0 || sym.MinSpread > 0.01 {
 			return fmt.Errorf("symbols[%d]: min_spread 必须在 (0, 0.01] 之间", i)
 		}
-		if sym.NearLayers < 1 || sym.NearLayers > 20 {
-			return fmt.Errorf("symbols[%d]: near_layers 必须在 1-20 之间", i)
+
+		// 【新增】统一几何网格配置验证和兼容处理
+		// 优先使用新配置，如果未设置则使用旧配置
+		if sym.TotalLayers == 0 {
+			sym.TotalLayers = sym.NearLayers + sym.FarLayers
+			if sym.TotalLayers == 0 {
+				return fmt.Errorf("symbols[%d]: total_layers 或 (near_layers + far_layers) 必须配置", i)
+			}
 		}
-		if sym.FarLayers < 0 || sym.FarLayers > 30 {
-			return fmt.Errorf("symbols[%d]: far_layers 必须在 0-30 之间", i)
+		// 验证总层数范围
+		if sym.TotalLayers < 1 || sym.TotalLayers > 50 {
+			return fmt.Errorf("symbols[%d]: total_layers 必须在 1-50 之间", i)
 		}
-		if sym.MaxCancelPerMin <= 0 || sym.MaxCancelPerMin > 100 {
-			return fmt.Errorf("symbols[%d]: max_cancel_per_min 必须在 (0, 100] 之间", i)
+
+		// 统一层大小兼容处理
+		if sym.UnifiedLayerSize == 0 {
+			if sym.BaseLayerSize > 0 {
+				sym.UnifiedLayerSize = sym.BaseLayerSize
+			} else {
+				return fmt.Errorf("symbols[%d]: unified_layer_size 或 base_layer_size 必须配置", i)
+			}
 		}
+		if sym.UnifiedLayerSize <= 0 {
+			return fmt.Errorf("symbols[%d]: unified_layer_size 必须 > 0", i)
+		}
+
+		// 几何网格参数验证（仅在配置了新参数时验证）
+		if sym.GridStartOffset > 0 || sym.GridFirstSpacing > 0 || sym.GridSpacingMultiplier > 0 {
+			if sym.GridStartOffset <= 0 {
+				return fmt.Errorf("symbols[%d]: grid_start_offset 必须 > 0", i)
+			}
+			if sym.GridFirstSpacing <= 0 {
+				return fmt.Errorf("symbols[%d]: grid_first_spacing 必须 > 0", i)
+			}
+			if sym.GridSpacingMultiplier <= 1.0 {
+				return fmt.Errorf("symbols[%d]: grid_spacing_multiplier 必须 > 1.0 (几何增长)", i)
+			}
+			if sym.GridMaxSpacing > 0 && sym.GridMaxSpacing < sym.GridFirstSpacing {
+				return fmt.Errorf("symbols[%d]: grid_max_spacing 必须 >= grid_first_spacing", i)
+			}
+		}
+
+		// 兼容旧配置的验证（如果新配置未设置）
+		if sym.GridStartOffset == 0 && sym.GridFirstSpacing == 0 {
+			if sym.NearLayers < 1 || sym.NearLayers > 20 {
+				return fmt.Errorf("symbols[%d]: near_layers 必须在 1-20 之间", i)
+			}
+			if sym.FarLayers < 0 || sym.FarLayers > 30 {
+				return fmt.Errorf("symbols[%d]: far_layers 必须在 0-30 之间", i)
+			}
+		}
+
+		if sym.MaxCancelPerMin <= 0 || sym.MaxCancelPerMin > 300 {
+			return fmt.Errorf("symbols[%d]: max_cancel_per_min 必须在 (0, 300] 之间", i)
+		}
+
+		// 验证模式阈值的合理性
+		if sym.PinningEnabled && sym.GrindingEnabled {
+			if sym.PinningThresh >= sym.GrindingThresh {
+				return fmt.Errorf("symbols[%d]: pinning_thresh (%.2f) 必须 < grinding_thresh (%.2f)，确保Grinding优先级高于Pinning",
+					i, sym.PinningThresh, sym.GrindingThresh)
+			}
+		}
+
+		// 验证阈值范围
+		if sym.PinningThresh > 0 && (sym.PinningThresh < 0.5 || sym.PinningThresh > 0.95) {
+			return fmt.Errorf("symbols[%d]: pinning_thresh 必须在 [0.5, 0.95] 之间", i)
+		}
+		if sym.GrindingThresh > 0 && (sym.GrindingThresh < 0.7 || sym.GrindingThresh > 0.98) {
+			return fmt.Errorf("symbols[%d]: grinding_thresh 必须在 [0.7, 0.98] 之间", i)
+		}
+
+		// 验证止损阈值
+		if sym.StopLossThresh > 0 && (sym.StopLossThresh < 0.05 || sym.StopLossThresh > 0.5) {
+			return fmt.Errorf("symbols[%d]: stop_loss_thresh 必须在 [0.05, 0.5] 之间", i)
+		}
+
+		// 回写到配置中（确保兼容性转换生效）
+		cfg.Symbols[i] = *sym
 	}
 
 	return nil

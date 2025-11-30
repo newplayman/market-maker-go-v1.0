@@ -86,7 +86,8 @@ func main() {
 			side = "BUY"
 		}
 
-		clientID := fmt.Sprintf("phoenix-emergency-%s-%d", symbol, time.Now().UnixNano())
+		// 生成符合交易所要求的客户端订单ID，使用毫秒时间戳
+		clientID := fmt.Sprintf("phoenix-emg-%d", time.Now().UnixMilli())
 		log.Warn().Str("symbol", symbol).Str("side", side).Float64("qty", qty).Msg("使用Reduce-Only市价单平仓...")
 		if _, err := rest.PlaceMarket(symbol, side, qty, true, clientID); err != nil {
 			log.Error().Err(err).Str("symbol", symbol).Msg("平仓下单失败")

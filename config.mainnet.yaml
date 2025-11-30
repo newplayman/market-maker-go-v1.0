@@ -4,8 +4,8 @@
 global:
   # ==================== API配置 ====================
   # ⚠️ 请替换为您的实盘API密钥
-  api_key: "YOUR_MAINNET_API_KEY"           # 替换为实盘API Key
-  api_secret: "YOUR_MAINNET_API_SECRET"     # 替换为实盘API Secret
+  api_key: "JDTnMB72CILecXzST7uex7qcvy185lFzzzItsoAim4o4NFa6Ey1bil6JGeXMZaeS"           # 替换为实盘API Key
+  api_secret: "RvaTepu3VWxkR5FbE0LOf2C6gIrppNWjDwYeyalKM9SnVtr8yawLFBSf7rfT2rVI"     # 替换为实盘API Secret
   
   # ==================== 网络配置 ====================
   testnet: false                            # ⚠️ 实盘模式
@@ -26,20 +26,20 @@ global:
 # ==================== 交易对配置 ====================
 # ⚠️ 实盘小资金测试配置
 symbols:
-  - symbol: "BTCUSDT"                       # 交易对
+  - symbol: "ETHUSDC"                      # 交易对（ETH永续合约）
     
     # 仓位限制（实盘小仓位测试）
-    net_max: 0.005                          # 最大净仓位 0.005 BTC (~$450)
+    net_max: 0.11                          # 最大净仓位复原为0.11 ETH，满足验证大于0.1的限制
     
     # 价差配置
     min_spread: 0.0005                      # 最小价差 0.05%
     
     # 价格和数量精度
-    tick_size: 0.1                          # 价格最小变动 $0.1
-    min_qty: 0.001                          # 最小下单量 0.001 BTC
+    tick_size: 0.01                         # 价格最小变动 $0.01
+    min_qty: 0.02                          # 最小下单量 0.02 ETH，匹配net_max
     
     # 挂单配置
-    base_layer_size: 0.001                  # 基础层级挂单量 0.001 BTC
+    base_layer_size: 0.02                   # 基础层级挂单量 0.02 ETH，匹配资金规模
     near_layers: 3                          # 近端层数 3层
     far_layers: 3                           # 远端层数 3层
     

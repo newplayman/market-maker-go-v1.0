@@ -36,6 +36,9 @@ type SymbolState struct {
 	FundingRate float64   // 资金费率
 	LastFill    time.Time // 最后成交时间
 
+	// 活跃订单数量统计
+	ActiveOrderCount int // 实际活跃订单数量
+
 	// 价格历史（环形缓冲）
 	PriceHistory      []float64
 	PriceHistoryIndex int
@@ -51,6 +54,9 @@ type SymbolState struct {
 	MaxDrawdown     float64 // 最大回撤
 	CancelCountLast int     // 最近一分钟撤单数
 	LastCancelReset time.Time
+
+	// 策略状态
+	LastMode string // 最后使用的策略模式 (normal/pinning/grinding)
 }
 
 type Store struct {
@@ -76,10 +82,23 @@ func (s *Store) GetActiveOrderCount(symbol string) int {
 	state.Mu.RLock()
 	defer state.Mu.RUnlock()
 
-	// 挂买单量 + 挂卖单量 作为活跃订单指标的近似（也可以改成订单列表长度统计）
-	// 这里按挂单量简单估计，若需要精确以订单Id列表实现。
-	activeCount := int(state.PendingBuy + state.PendingSell)
-	return activeCount
+	// 返回实际统计的活跃订单数量
+	return state.ActiveOrderCount
+}
+
+// SetActiveOrderCount 设置指定符号的活跃订单数量
+func (s *Store) SetActiveOrderCount(symbol string, count int) {
+	s.mu.RLock()
+	state, exists := s.symbols[symbol]
+	s.mu.RUnlock()
+
+	if !exists || state == nil {
+		return
+	}
+
+	state.Mu.Lock()
+	state.ActiveOrderCount = count
+	state.Mu.Unlock()
 }
 
 // NewStore 创建新的存储实例

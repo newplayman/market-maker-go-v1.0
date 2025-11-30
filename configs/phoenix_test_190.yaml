@@ -1,0 +1,38 @@
+global:
+  total_notional_max: 2000  # $2k cap (190 USDC资金下，留50%缓冲)
+  quote_interval_ms: 200    # 报价间隔<200ms，高频
+  stop_loss_pct: -20.0      # 全局-20%强制平仓
+  grinding_halt_seconds: 300 # grinding后冷却5min
+  metrics_port: 8080        # prometheus metrics port
+  api_key: ${BINANCE_API_KEY}
+  api_secret: ${BINANCE_API_SECRET}
+  snapshot_path: "./data/snapshot_test.json"
+  snapshot_interval: 60     # 快照间隔60秒
+
+symbols:
+  - symbol: ETHUSDC
+    net_max: 0.15            # 净仓帽0.15手 (名义~10k @ ETH~$2000，风险<10%回撤)
+    min_spread: 0.0005       # 最小spread 5bps (降低以满足要求)
+    tick_size: 0.01          # Binance ETHUSDC tick (修复: 0.1->0.01)
+    near_layers: 8           # 动态near层 (adaptive skew)
+    far_layers: 16           # 固定far层 (几何: ±2% base + 2*stdDev)
+    min_qty: 0.01            # 最小挂单量 (提高到满足交易所要求)
+    max_orders_per_side: 24  # 硬限24层/side (防堆积)
+    base_layer_size: 0.01    # 基础层订单大小
+    far_layer_size: 0.01     # 远端层订单大小 (提高到满足交易所要求)
+    max_cancel_per_min: 50   # 每分钟最大撤单数
+    pinning_enabled: true    # 启用钉子模式
+    pinning_thresh: 0.7      # 钉子模式阈值 70%
+    grinding_enabled: true   # 启用磨仓模式
+    grinding_thresh: 0.87    # 磨仓模式阈值 87% (修复: 必须>pinning_thresh，符合文档规范)
+    stop_loss_thresh: 0.05   # 止损阈值
+    layer_spacing_mode: geometric  # 层间距模式: geometric(几何) | linear(线性)
+    spacing_ratio: 1.194     # 几何增长公比，实现从1.2U到20U的递增
+    
+    # 近端层参数 - 实现更紧的盘口报价 (约1U @ 3000U价格)
+    near_layer_start_offset: 0.00033   # 近端起始偏移 ~1U @ 3000U
+    near_layer_spacing_ratio: 1.15     # 近端层间距几何公比
+    
+    # 远端层参数
+    far_layer_start_offset: 0.0067     # 远端起始偏移
+    far_layer_end_offset: 0.02         # 远端结束偏移

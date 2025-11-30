@@ -149,7 +149,7 @@ func TestCalculateOrderDiff(t *testing.T) {
 		{ClientOrderID: "new2", Side: "SELL", Price: 102.0, Quantity: 1.0},
 	}
 
-	toCancel, toPlace := om.CalculateOrderDiff("BTCUSDT", desiredBuy, desiredSell)
+	toCancel, toPlace := om.CalculateOrderDiff("BTCUSDT", desiredBuy, desiredSell, 0.01)
 
 	if len(toCancel) != 2 {
 		t.Fatalf("场景1: 期望撤销2个订单，实际%d个", len(toCancel))
@@ -169,7 +169,7 @@ func TestCalculateOrderDiff(t *testing.T) {
 		{Side: "BUY", Price: 100.0, Quantity: 2.0}, // 数量不同
 	}
 
-	toCancel2, toPlace2 := om.CalculateOrderDiff("BTCUSDT", desiredBuy2, nil)
+	toCancel2, toPlace2 := om.CalculateOrderDiff("BTCUSDT", desiredBuy2, nil, 0.01)
 
 	if len(toCancel2) != 1 {
 		t.Fatalf("场景2: 期望撤销1个订单（数量变化），实际%d个", len(toCancel2))
@@ -193,7 +193,7 @@ func TestCalculateOrderDiff(t *testing.T) {
 		{Side: "SELL", Price: 101.0, Quantity: 1.0},
 	}
 
-	toCancel3, toPlace3 := om.CalculateOrderDiff("BTCUSDT", desiredBuy3, desiredSell3)
+	toCancel3, toPlace3 := om.CalculateOrderDiff("BTCUSDT", desiredBuy3, desiredSell3, 0.01)
 
 	if len(toCancel3) != 0 {
 		t.Fatalf("场景3: 订单完全匹配，不应撤销订单，实际撤销%d个", len(toCancel3))

@@ -9,6 +9,13 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// Quote 报价结构（从strategy包复制，避免循环依赖）
+type Quote struct {
+	Price float64
+	Size  float64
+	Layer int
+}
+
 // RiskManager 风控管理器
 type RiskManager struct {
 	cfg   *config.Config
@@ -51,13 +58,32 @@ func (r *RiskManager) CheckPreTrade(symbol string, side string, size float64) er
 		newPos = currentPos - size
 	}
 
-	// 允许减仓单超过限制，但禁止开仓单超过限制，避免死锁
-	if math.Abs(newPos) > symCfg.NetMax {
-		if (side == "BUY" && newPos > currentPos) || (side == "SELL" && newPos < currentPos) {
-			// 这是开仓方向，拒绝
-			return fmt.Errorf("净仓位 %.4f 超过限制 %.4f (开仓被拒绝)", math.Abs(newPos), symCfg.NetMax)
+	// 检查是否处于Grinding模式
+	isGrindingMode := symCfg.GrindingEnabled && math.Abs(currentPos)/symCfg.NetMax > symCfg.GrindingThresh
+	isReducingPosition := (currentPos > 0 && side == "SELL") || (currentPos < 0 && side == "BUY")
+
+	// Grinding模式的风控豁免：允许减仓单超过NetMax限制
+	if isGrindingMode && isReducingPosition {
+		// Grinding减仓单放宽限制到NetMax的120%
+		if math.Abs(newPos) > symCfg.NetMax*1.2 {
+			return fmt.Errorf("Grinding减仓单净仓位 %.4f 超过宽松限制 %.4f", math.Abs(newPos), symCfg.NetMax*1.2)
 		}
-		// 减仓方向允许通过
+		// 通过Grinding减仓检查，跳过后续的正常仓位检查
+		log.Debug().
+			Str("symbol", symbol).
+			Float64("pos", currentPos).
+			Str("side", side).
+			Float64("size", size).
+			Msg("Grinding减仓单通过风控豁免")
+	} else {
+		// 正常模式：允许减仓单超过限制，但禁止开仓单超过限制，避免死锁
+		if math.Abs(newPos) > symCfg.NetMax {
+			if (side == "BUY" && newPos > currentPos) || (side == "SELL" && newPos < currentPos) {
+				// 这是开仓方向，拒绝
+				return fmt.Errorf("净仓位 %.4f 超过限制 %.4f (开仓被拒绝)", math.Abs(newPos), symCfg.NetMax)
+			}
+			// 减仓方向允许通过
+		}
 	}
 
 	// 3. 检查最坏情况敞口
@@ -83,6 +109,97 @@ func (r *RiskManager) CheckPreTrade(symbol string, side string, size float64) er
 	if cancelCount >= symCfg.MaxCancelPerMin {
 		return fmt.Errorf("撤单频率过高: %d/min >= %d/min", cancelCount, symCfg.MaxCancelPerMin)
 	}
+
+	return nil
+}
+
+// CheckBatchPreTrade 批量检查所有报价的累计风险
+// 这是轻仓做市的核心风控：确保所有挂单即使全部成交也不会超过安全限制
+func (r *RiskManager) CheckBatchPreTrade(symbol string, buyQuotes, sellQuotes []Quote) error {
+	symCfg := r.cfg.GetSymbolConfig(symbol)
+	if symCfg == nil {
+		return fmt.Errorf("交易对 %s 未配置", symbol)
+	}
+
+	state := r.store.GetSymbolState(symbol)
+	if state == nil {
+		return fmt.Errorf("交易对 %s 未初始化", symbol)
+	}
+
+	// 计算当前仓位
+	state.Mu.RLock()
+	currentPos := state.Position.Size
+	state.Mu.RUnlock()
+
+	// 计算所有买单的总量
+	totalBuySize := 0.0
+	for _, q := range buyQuotes {
+		totalBuySize += q.Size
+	}
+
+	// 计算所有卖单的总量
+	totalSellSize := 0.0
+	for _, q := range sellQuotes {
+		totalSellSize += q.Size
+	}
+
+	// 计算最坏情况：
+	// 1. 所有买单成交 -> 仓位变成 currentPos + totalBuySize
+	// 2. 所有卖单成交 -> 仓位变成 currentPos - totalSellSize
+	worstCaseLong := currentPos + totalBuySize
+	worstCaseShort := currentPos - totalSellSize
+
+	// 【关键修复】轻仓做市原则：根据当前仓位方向，只限制加仓方向
+	// 原则：
+	// - 持有多头时，限制买单（加仓方向），不限制卖单（平仓方向）
+	// - 持有空头时，限制卖单（加仓方向），不限制买单（平仓方向）
+	// - 无仓位时，双向都限制
+	maxWorstCase := symCfg.NetMax * 0.5
+
+	// 根据当前仓位决定检查哪个方向
+	if currentPos >= 0 {
+		// 无仓位或多头仓位：只检查买单方向（避免加仓过度）
+		if math.Abs(worstCaseLong) > maxWorstCase {
+			log.Warn().
+				Str("symbol", symbol).
+				Float64("current_pos", currentPos).
+				Float64("total_buy_size", totalBuySize).
+				Float64("worst_case_long", worstCaseLong).
+				Float64("max_worst_case", maxWorstCase).
+				Msg("批量风控：最坏情况多头敞口超限")
+			return fmt.Errorf("最坏情况多头敞口 %.4f 超过安全限制 %.4f (当前仓位%.4f + 总买单%.4f)",
+				math.Abs(worstCaseLong), maxWorstCase, currentPos, totalBuySize)
+		}
+		// 卖单方向不检查（平仓方向应允许）
+	}
+
+	if currentPos <= 0 {
+		// 无仓位或空头仓位：只检查卖单方向（避免加仓过度）
+		if math.Abs(worstCaseShort) > maxWorstCase {
+			log.Warn().
+				Str("symbol", symbol).
+				Float64("current_pos", currentPos).
+				Float64("total_sell_size", totalSellSize).
+				Float64("worst_case_short", worstCaseShort).
+				Float64("max_worst_case", maxWorstCase).
+				Msg("批量风控：最坏情况空头敞口超限")
+			return fmt.Errorf("最坏情况空头敞口 %.4f 超过安全限制 %.4f (当前仓位%.4f - 总卖单%.4f)",
+				math.Abs(worstCaseShort), maxWorstCase, currentPos, totalSellSize)
+		}
+		// 买单方向不检查（平仓方向应允许）
+	}
+
+	log.Debug().
+		Str("symbol", symbol).
+		Float64("current_pos", currentPos).
+		Float64("total_buy", totalBuySize).
+		Float64("total_sell", totalSellSize).
+		Float64("worst_long", worstCaseLong).
+		Float64("worst_short", worstCaseShort).
+		Float64("max_allowed", maxWorstCase).
+		Int("buy_layers", len(buyQuotes)).
+		Int("sell_layers", len(sellQuotes)).
+		Msg("批量风控检查通过")
 
 	return nil
 }

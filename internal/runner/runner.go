@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -158,6 +159,28 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 		metrics.QuoteGeneration.WithLabelValues(symbol).Observe(duration)
 	}()
 
+	// 【修复假死】无条件检查并重置撤单计数器（防止假死）
+	// 必须在函数开头执行，确保每次循环都会检查
+	symCfg := r.cfg.GetSymbolConfig(symbol)
+	if symCfg != nil {
+		state := r.store.GetSymbolState(symbol)
+		if state != nil {
+			state.Mu.Lock()
+			if time.Since(state.LastCancelReset) > time.Minute {
+				oldCount := state.CancelCountLast
+				state.CancelCountLast = 0
+				state.LastCancelReset = time.Now()
+				if oldCount > 0 {
+					log.Info().
+						Str("symbol", symbol).
+						Int("reset_from", oldCount).
+						Msg("撤单计数器已重置（每分钟自动）")
+				}
+			}
+			state.Mu.Unlock()
+		}
+	}
+
 	// 订单溢出熔断阈值
 	const orderOverflowThreshold = 50
 
@@ -198,20 +221,144 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 		// TODO: 执行减仓逻辑
 	}
 
-	// 3. 生成报价
+	// 3. 检查撤单频率，接近限制时记录警告但继续执行
+	if symCfg != nil {
+		state := r.store.GetSymbolState(symbol)
+		if state != nil {
+			state.Mu.RLock()
+			cancelCount := state.CancelCountLast
+			state.Mu.RUnlock()
+
+			// 当撤单数接近限制的95%时，记录警告（不跳过报价）
+			if cancelCount >= int(float64(symCfg.MaxCancelPerMin)*0.95) {
+				log.Warn().
+					Str("symbol", symbol).
+					Int("cancel_count", cancelCount).
+					Int("limit", symCfg.MaxCancelPerMin).
+					Msg("撤单频率接近限制，请注意风险（不跳过报价）")
+				// 不返回，继续执行
+			}
+		}
+	}
+
+	// 4. 生成报价
+	// 在生成报价前，重置Pending状态，因为接下来的报价将完全替换现有挂单
+	// 这样可以避免RiskManager在Pre-Trade检查时重复计算现有挂单的敞口
+	r.store.UpdatePendingOrders(symbol, 0, 0)
+
 	buyQuotes, sellQuotes, err := r.strategy.GenerateQuotes(ctx, symbol)
 	if err != nil {
 		return fmt.Errorf("生成报价失败: %w", err)
 	}
 
-	// 4. 验证报价
+	// 【新增】生成报价后，记录详细网格信息
+	if len(buyQuotes) > 0 && len(sellQuotes) > 0 {
+		state := r.store.GetSymbolState(symbol)
+		mid := 0.0
+		currentPos := 0.0
+		if state != nil {
+			state.Mu.RLock()
+			mid = state.MidPrice
+			currentPos = state.Position.Size
+			state.Mu.RUnlock()
+		}
+
+		// 计算买1卖1距离mid
+		buy1Distance := mid - buyQuotes[0].Price
+		sell1Distance := sellQuotes[0].Price - mid
+
+		// 计算第1-2层间距
+		buy12Spacing := 0.0
+		sell12Spacing := 0.0
+		if len(buyQuotes) >= 2 {
+			buy12Spacing = buyQuotes[0].Price - buyQuotes[1].Price
+		}
+		if len(sellQuotes) >= 2 {
+			sell12Spacing = sellQuotes[1].Price - sellQuotes[0].Price
+		}
+
+		// 计算最后一层间距（倒数第2到倒数第1层）
+		buyLastSpacing := 0.0
+		sellLastSpacing := 0.0
+		if len(buyQuotes) >= 2 {
+			lastIdx := len(buyQuotes) - 1
+			buyLastSpacing = buyQuotes[lastIdx-1].Price - buyQuotes[lastIdx].Price
+		}
+		if len(sellQuotes) >= 2 {
+			lastIdx := len(sellQuotes) - 1
+			sellLastSpacing = sellQuotes[lastIdx].Price - sellQuotes[lastIdx-1].Price
+		}
+
+		log.Info().
+			Str("symbol", symbol).
+			Float64("mid", mid).
+			Float64("pos", currentPos).
+			Int("buy_layers", len(buyQuotes)).
+			Int("sell_layers", len(sellQuotes)).
+			Float64("buy1", buyQuotes[0].Price).
+			Float64("sell1", sellQuotes[0].Price).
+			Float64("buy1_dist", buy1Distance).
+			Float64("sell1_dist", sell1Distance).
+			Float64("buy12_spacing", buy12Spacing).
+			Float64("sell12_spacing", sell12Spacing).
+			Float64("buy_last", buyQuotes[len(buyQuotes)-1].Price).
+			Float64("sell_last", sellQuotes[len(sellQuotes)-1].Price).
+			Float64("buy_last_spacing", buyLastSpacing).
+			Float64("sell_last_spacing", sellLastSpacing).
+			Float64("total_buy_size", func() float64 {
+				total := 0.0
+				for _, q := range buyQuotes {
+					total += q.Size
+				}
+				return total
+			}()).
+			Float64("total_sell_size", func() float64 {
+				total := 0.0
+				for _, q := range sellQuotes {
+					total += q.Size
+				}
+				return total
+			}()).
+			Msg("报价已生成（统一几何网格）")
+	}
+
+	// 5. 批量风控检查（新增）- 确保轻仓做市原则
+	// 检查所有挂单累计风险，防止满仓
+	buyRiskQuotes := make([]risk.Quote, len(buyQuotes))
+	for i, q := range buyQuotes {
+		buyRiskQuotes[i] = risk.Quote{Price: q.Price, Size: q.Size, Layer: q.Layer}
+	}
+	sellRiskQuotes := make([]risk.Quote, len(sellQuotes))
+	for i, q := range sellQuotes {
+		sellRiskQuotes[i] = risk.Quote{Price: q.Price, Size: q.Size, Layer: q.Layer}
+	}
+
+	if err := r.risk.CheckBatchPreTrade(symbol, buyRiskQuotes, sellRiskQuotes); err != nil {
+		log.Warn().
+			Err(err).
+			Str("symbol", symbol).
+			Int("buy_quotes", len(buyQuotes)).
+			Int("sell_quotes", len(sellQuotes)).
+			Msg("批量风控检查失败，调整报价数量")
+
+		// 根据风控结果调整报价数量/大小
+		buyQuotes, sellQuotes = r.adjustQuotesForRisk(symbol, buyQuotes, sellQuotes)
+
+		log.Info().
+			Str("symbol", symbol).
+			Int("adjusted_buy_quotes", len(buyQuotes)).
+			Int("adjusted_sell_quotes", len(sellQuotes)).
+			Msg("报价已根据风控要求调整")
+	}
+
+	// 6. 验证报价
 	if len(buyQuotes) > 0 && len(sellQuotes) > 0 {
 		if err := r.risk.ValidateQuotes(symbol, buyQuotes[0].Price, sellQuotes[0].Price); err != nil {
 			return fmt.Errorf("报价验证失败: %w", err)
 		}
 	}
 
-	// 5. 转换为exchange.Order并进行Pre-Trade风控校验
+	// 7. 转换为exchange.Order并进行Pre-Trade风控校验
 	desiredBuyOrders := make([]*gateway.Order, 0, len(buyQuotes))
 	for _, quote := range buyQuotes {
 		// Pre-Trade风控检查：每个买单都需要通过风控校验
@@ -254,16 +401,65 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 		})
 	}
 
-	// 6. 同步当前本地订单状态（从exchange拉取）
+	// 8. 同步当前本地订单状态（从exchange拉取）
 	if err := r.om.SyncActiveOrders(ctx, symbol); err != nil {
 		log.Error().Err(err).Str("symbol", symbol).Msg("同步活跃订单失败")
 		return err
 	}
 
-	// 7. 计算订单差分，获取待撤销和待新增订单
-	toCancel, toPlace := r.om.CalculateOrderDiff(symbol, desiredBuyOrders, desiredSellOrders)
+	// 9. 计算订单差分，获取待撤销和待新增订单
+	symCfg = r.cfg.GetSymbolConfig(symbol)
 
-	// 8. 应用差分，执行撤单和新单下单
+	// 计算防闪烁容差 (Anti-Flicker Tolerance)
+	// 【关键】容差决定了何时撤单重挂，容差越大，撤单频率越低
+	// 策略：使用第一层间距作为基准，容差设为其50-80%
+	state := r.store.GetSymbolState(symbol)
+	tolerance := symCfg.TickSize * 5 // 默认最小容差: 5个tick (0.05 USDT)
+
+	if state != nil && state.MidPrice > 0 {
+		// 【新】优先使用统一几何网格参数
+		var layerSpacing float64
+		if symCfg.GridFirstSpacing > 0 {
+			// 使用新配置：第一层间距（USDT绝对值）
+			layerSpacing = symCfg.GridFirstSpacing
+		} else if symCfg.NearLayerStartOffset > 0 {
+			// 兼容旧配置：近端起始偏移（比例）
+			layerSpacing = state.MidPrice * symCfg.NearLayerStartOffset
+		} else {
+			// 默认值：约0.5%的价格波动
+			layerSpacing = state.MidPrice * 0.005
+		}
+
+		// 【防闪烁】容差 = 层间距 × 90%
+		// 这意味着只有当价格偏离超过90%的层间距时才撤单重挂
+		// 例如：层间距1.2U，容差1.08U，价格波动<1.08U不会触发撤单
+		// 这是非常保守的策略，优先保持订单稳定性而非追求完美价格
+		tolerance = layerSpacing * 0.9
+
+		// 设置容差范围限制
+		minTolerance := symCfg.TickSize * 10                    // 最小10个tick (0.1 USDT)
+		maxTolerance := state.MidPrice * symCfg.MinSpread * 3.0 // 最大为MinSpread的3倍
+
+		if tolerance < minTolerance {
+			tolerance = minTolerance
+		}
+		if tolerance > maxTolerance {
+			tolerance = maxTolerance
+		}
+
+		log.Info().
+			Str("symbol", symbol).
+			Float64("mid", state.MidPrice).
+			Float64("layer_spacing", layerSpacing).
+			Float64("tolerance", tolerance).
+			Float64("tolerance_usdt", tolerance).
+			Float64("tolerance_pct", tolerance/state.MidPrice*100).
+			Msg("防闪烁容差计算完成")
+	}
+
+	toCancel, toPlace := r.om.CalculateOrderDiff(symbol, desiredBuyOrders, desiredSellOrders, tolerance)
+
+	// 10. 应用差分，执行撤单和新单下单
 	if r.dryRun {
 		log.Info().
 			Str("symbol", symbol).
@@ -289,10 +485,116 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 		Int("sell_quotes", len(sellQuotes)).
 		Msg("报价已下达")
 
-	// 8. 更新指标
+	// 10. 更新指标
 	r.updateSymbolMetrics(symbol)
 
 	return nil
+}
+
+// adjustQuotesForRisk 根据风控要求调整报价数量和大小
+// 当批量风控检查失败时，削减挂单层数以满足轻仓做市原则
+func (r *Runner) adjustQuotesForRisk(symbol string, buyQuotes, sellQuotes []strategy.Quote) ([]strategy.Quote, []strategy.Quote) {
+	symCfg := r.cfg.GetSymbolConfig(symbol)
+	if symCfg == nil {
+		return buyQuotes, sellQuotes
+	}
+
+	state := r.store.GetSymbolState(symbol)
+	if state == nil {
+		return buyQuotes, sellQuotes
+	}
+
+	state.Mu.RLock()
+	currentPos := state.Position.Size
+	state.Mu.RUnlock()
+
+	// 计算当前仓位比例
+	posRatio := math.Abs(currentPos) / symCfg.NetMax
+
+	// 轻仓做市原则：最坏情况敞口不应超过NetMax的50%
+	maxWorstCase := symCfg.NetMax * 0.5
+
+	// 计算允许的最大挂单总量
+	var maxBuySize, maxSellSize float64
+	if currentPos > 0 {
+		// 多头仓位：限制买单，放松卖单
+		maxBuySize = maxWorstCase - math.Abs(currentPos)
+		maxSellSize = maxWorstCase + math.Abs(currentPos)
+	} else if currentPos < 0 {
+		// 空头仓位：限制卖单，放松买单
+		maxBuySize = maxWorstCase + math.Abs(currentPos)
+		maxSellSize = maxWorstCase - math.Abs(currentPos)
+	} else {
+		// 无仓位：双边对称
+		maxBuySize = maxWorstCase
+		maxSellSize = maxWorstCase
+	}
+
+	// 确保至少为正数
+	if maxBuySize < 0 {
+		maxBuySize = 0
+	}
+	if maxSellSize < 0 {
+		maxSellSize = 0
+	}
+
+	// 削减买单
+	adjustedBuyQuotes := make([]strategy.Quote, 0, len(buyQuotes))
+	totalBuySize := 0.0
+	for _, q := range buyQuotes {
+		if totalBuySize+q.Size <= maxBuySize {
+			adjustedBuyQuotes = append(adjustedBuyQuotes, q)
+			totalBuySize += q.Size
+		} else {
+			// 尝试部分添加
+			remainingSize := maxBuySize - totalBuySize
+			if remainingSize >= symCfg.MinQty {
+				adjustedBuyQuotes = append(adjustedBuyQuotes, strategy.Quote{
+					Price: q.Price,
+					Size:  remainingSize,
+					Layer: q.Layer,
+				})
+			}
+			break
+		}
+	}
+
+	// 削减卖单
+	adjustedSellQuotes := make([]strategy.Quote, 0, len(sellQuotes))
+	totalSellSize := 0.0
+	for _, q := range sellQuotes {
+		if totalSellSize+q.Size <= maxSellSize {
+			adjustedSellQuotes = append(adjustedSellQuotes, q)
+			totalSellSize += q.Size
+		} else {
+			// 尝试部分添加
+			remainingSize := maxSellSize - totalSellSize
+			if remainingSize >= symCfg.MinQty {
+				adjustedSellQuotes = append(adjustedSellQuotes, strategy.Quote{
+					Price: q.Price,
+					Size:  remainingSize,
+					Layer: q.Layer,
+				})
+			}
+			break
+		}
+	}
+
+	log.Info().
+		Str("symbol", symbol).
+		Float64("pos", currentPos).
+		Float64("pos_ratio", posRatio).
+		Int("original_buy_layers", len(buyQuotes)).
+		Int("original_sell_layers", len(sellQuotes)).
+		Int("adjusted_buy_layers", len(adjustedBuyQuotes)).
+		Int("adjusted_sell_layers", len(adjustedSellQuotes)).
+		Float64("total_buy_size", totalBuySize).
+		Float64("total_sell_size", totalSellSize).
+		Float64("max_buy_allowed", maxBuySize).
+		Float64("max_sell_allowed", maxSellSize).
+		Msg("根据风控要求调整报价")
+
+	return adjustedBuyQuotes, adjustedSellQuotes
 }
 
 // onDepthUpdate 处理深度更新

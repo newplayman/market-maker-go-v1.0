@@ -296,14 +296,54 @@ func parseDepthLevel(levels [][]string) float64 {
 	return val
 }
 
-// CancelOrder 调用 /fapi/v1/order 取消。
+// CancelOrder 调用 /fapi/v1/order 取消订单。
+// 支持两种方式：通过orderId（数字）或origClientOrderId（字符串）取消
 func (c *BinanceRESTClient) CancelOrder(symbol, orderID string) error {
 	if c == nil || c.HTTPClient == nil {
 		return fmt.Errorf("http client not set")
 	}
 	params := map[string]string{
-		"symbol":  symbol,
-		"orderId": orderID,
+		"symbol": symbol,
+	}
+
+	// 判断是否是数字形式的orderId还是字符串形式的clientOrderId
+	// 如果以"phoenix-"开头，说明是我们生成的clientOrderId
+	if strings.HasPrefix(orderID, "phoenix-") {
+		params["origClientOrderId"] = orderID
+	} else {
+		// 尝试解析为数字，如果成功则用orderId
+		if _, err := strconv.ParseInt(orderID, 10, 64); err == nil {
+			params["orderId"] = orderID
+		} else {
+			// 默认作为clientOrderId处理
+			params["origClientOrderId"] = orderID
+		}
+	}
+
+	c.applyRecvWindow(params)
+	query, sig := SignParams(params, c.Secret)
+	endpoint := c.BaseURL + "/fapi/v1/order?" + query + "&signature=" + url.QueryEscape(sig)
+	headers := map[string]string{"X-MBX-APIKEY": c.APIKey}
+	resp, err := c.sendWithRetry(http.MethodDelete, endpoint, headers)
+	if err != nil {
+		return err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("cancel status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
+	}
+	return nil
+}
+
+// CancelOrderByClientID 通过客户端订单ID取消订单
+func (c *BinanceRESTClient) CancelOrderByClientID(symbol, clientOrderID string) error {
+	if c == nil || c.HTTPClient == nil {
+		return fmt.Errorf("http client not set")
+	}
+	params := map[string]string{
+		"symbol":            symbol,
+		"origClientOrderId": clientOrderID,
 	}
 	c.applyRecvWindow(params)
 	query, sig := SignParams(params, c.Secret)
@@ -313,9 +353,35 @@ func (c *BinanceRESTClient) CancelOrder(symbol, orderID string) error {
 	if err != nil {
 		return err
 	}
+	body, _ := io.ReadAll(resp.Body)
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("cancel status %d", resp.StatusCode)
+		return fmt.Errorf("cancel by client id status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
+	}
+	return nil
+}
+
+// CancelOrderByOrderID 通过交易所订单ID取消订单
+func (c *BinanceRESTClient) CancelOrderByOrderID(symbol string, orderID int64) error {
+	if c == nil || c.HTTPClient == nil {
+		return fmt.Errorf("http client not set")
+	}
+	params := map[string]string{
+		"symbol":  symbol,
+		"orderId": strconv.FormatInt(orderID, 10),
+	}
+	c.applyRecvWindow(params)
+	query, sig := SignParams(params, c.Secret)
+	endpoint := c.BaseURL + "/fapi/v1/order?" + query + "&signature=" + url.QueryEscape(sig)
+	headers := map[string]string{"X-MBX-APIKEY": c.APIKey}
+	resp, err := c.sendWithRetry(http.MethodDelete, endpoint, headers)
+	if err != nil {
+		return err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("cancel by order id status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
 	}
 	return nil
 }

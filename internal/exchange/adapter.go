@@ -12,20 +12,22 @@ import (
 
 // BinanceAdapter implements Exchange interface
 type BinanceAdapter struct {
-	rest      BinanceREST
-	ws        BinanceWS
-	tradeWS   *TradeWSClient  // WebSocket trading client
-	connected bool
-	mu        sync.RWMutex
+	rest       BinanceREST
+	restClient *BinanceRESTClient // 直接访问REST客户端以调用OpenOrders等方法
+	ws         BinanceWS
+	tradeWS    *TradeWSClient // WebSocket trading client
+	connected  bool
+	mu         sync.RWMutex
 
 	// Callbacks
 	depthCallback func(*Depth)
 	userCallbacks *UserStreamCallbacks
 
 	// State
-	positions map[string]*Position
-	orders    map[string]*Order
-	stateMu   sync.RWMutex
+	positions  map[string]*Position
+	orders     map[string]*Order // key: clientOrderID -> Order
+	orderIDMap map[string]int64  // key: clientOrderID -> exchange orderId (数字)
+	stateMu    sync.RWMutex
 }
 
 // NewBinanceAdapter creates a new Binance exchange adapter
@@ -38,7 +40,7 @@ func NewBinanceAdapter(rest BinanceREST, ws BinanceWS) *BinanceAdapter {
 		apiKey = restClient.APIKey
 		secretKey = restClient.Secret
 	}
-	
+
 	tradeWS := NewTradeWSClient(TradeWSConfig{
 		BaseURL:      "wss://ws-fapi.binance.com/ws-fapi/v1",
 		APIKey:       apiKey,
@@ -48,14 +50,22 @@ func NewBinanceAdapter(rest BinanceREST, ws BinanceWS) *BinanceAdapter {
 		RetryBackoff: time.Second,
 		MaxRetries:   5,
 	})
-	
-	return &BinanceAdapter{
-		rest:      rest,
-		ws:        ws,
-		tradeWS:   tradeWS,
-		positions: make(map[string]*Position),
-		orders:    make(map[string]*Order),
+
+	adapter := &BinanceAdapter{
+		rest:       rest,
+		ws:         ws,
+		tradeWS:    tradeWS,
+		positions:  make(map[string]*Position),
+		orders:     make(map[string]*Order),
+		orderIDMap: make(map[string]int64),
 	}
+
+	// 保存REST客户端引用以便调用OpenOrders等方法
+	if restClient, ok := rest.(*BinanceRESTClient); ok {
+		adapter.restClient = restClient
+	}
+
+	return adapter
 }
 
 // PlaceOrder places a new order via REST API (fallback from WSS)
@@ -66,7 +76,8 @@ func (b *BinanceAdapter) PlaceOrder(ctx context.Context, order *Order) (*Order, 
 
 	// Generate client order ID if not provided
 	if order.ClientOrderID == "" {
-		order.ClientOrderID = fmt.Sprintf("phoenix-%s-%d", order.Symbol, time.Now().UnixNano())
+		// 使用Unix毫秒时间戳确保订单ID长度符合交易所要求(小于36字符)
+		order.ClientOrderID = fmt.Sprintf("phoenix-%s-%d", order.Symbol, time.Now().UnixMilli())
 	}
 
 	// Use REST API as fallback (WSS requires special API key permissions)
@@ -80,7 +91,7 @@ func (b *BinanceAdapter) PlaceOrder(ctx context.Context, order *Order) (*Order, 
 		true,  // postOnly - Maker-only for free fees
 		order.ClientOrderID,
 	)
-	
+
 	// If Post Only failed with -5022 error (would execute as taker), skip
 	if err != nil && strings.Contains(err.Error(), "-5022") {
 		log.Debug().
@@ -90,7 +101,7 @@ func (b *BinanceAdapter) PlaceOrder(ctx context.Context, order *Order) (*Order, 
 			Msg("订单价格过近，跳过Post Only失败的订单(REST)")
 		return nil, err
 	}
-	
+
 	if err != nil {
 		return nil, fmt.Errorf("rest place order failed: %w", err)
 	}
@@ -127,6 +138,15 @@ func (b *BinanceAdapter) CancelOrder(ctx context.Context, symbol, clientOrderID 
 		return fmt.Errorf("rest cancel order failed: %w", err)
 	}
 
+	// 撤单成功后，从本地订单map中删除该订单
+	b.stateMu.Lock()
+	if order, exists := b.orders[clientOrderID]; exists {
+		order.Status = "CANCELED"
+		delete(b.orders, clientOrderID)
+	}
+	delete(b.orderIDMap, clientOrderID)
+	b.stateMu.Unlock()
+
 	log.Info().
 		Str("symbol", symbol).
 		Str("client_id", clientOrderID).
@@ -161,8 +181,60 @@ func (b *BinanceAdapter) CancelAllOrders(ctx context.Context, symbol string) err
 	return nil
 }
 
-// GetOpenOrders returns all open orders for a symbol
+// GetOpenOrders returns all open orders for a symbol from exchange REST API
 func (b *BinanceAdapter) GetOpenOrders(ctx context.Context, symbol string) ([]*Order, error) {
+	// 优先使用REST API获取真实的交易所订单列表
+	if b.restClient != nil {
+		exchangeOrders, err := b.restClient.OpenOrders(symbol)
+		if err != nil {
+			log.Error().Err(err).Str("symbol", symbol).Msg("REST获取活跃订单失败，回退到本地缓存")
+			// 回退到本地缓存
+			return b.getLocalOpenOrders(symbol), nil
+		}
+
+		// 将交易所订单转换为内部Order结构，并同步到本地缓存
+		orders := make([]*Order, 0, len(exchangeOrders))
+		b.stateMu.Lock()
+		// 清空该symbol的旧订单
+		for clientID, order := range b.orders {
+			if order.Symbol == symbol {
+				delete(b.orders, clientID)
+				delete(b.orderIDMap, clientID)
+			}
+		}
+		// 添加从交易所获取的订单
+		for _, eo := range exchangeOrders {
+			order := &Order{
+				Symbol:        eo.Symbol,
+				Side:          eo.Side,
+				Type:          eo.OrderType,
+				Status:        eo.Status,
+				ClientOrderID: eo.ClientOrderID,
+				Price:         eo.Price,
+				Quantity:      eo.OrigQty,
+				FilledQty:     eo.ExecutedQty,
+			}
+			orders = append(orders, order)
+			// 同步到本地缓存
+			b.orders[eo.ClientOrderID] = order
+			b.orderIDMap[eo.ClientOrderID] = eo.OrderID
+		}
+		b.stateMu.Unlock()
+
+		log.Debug().
+			Str("symbol", symbol).
+			Int("count", len(orders)).
+			Msg("从交易所同步活跃订单")
+
+		return orders, nil
+	}
+
+	// 如果没有REST客户端，回退到本地缓存
+	return b.getLocalOpenOrders(symbol), nil
+}
+
+// getLocalOpenOrders 从本地缓存获取活跃订单
+func (b *BinanceAdapter) getLocalOpenOrders(symbol string) []*Order {
 	b.stateMu.RLock()
 	defer b.stateMu.RUnlock()
 
@@ -172,8 +244,7 @@ func (b *BinanceAdapter) GetOpenOrders(ctx context.Context, symbol string) ([]*O
 			orders = append(orders, order)
 		}
 	}
-
-	return orders, nil
+	return orders
 }
 
 // GetPosition returns the position for a symbol

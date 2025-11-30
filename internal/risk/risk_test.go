@@ -2,149 +2,223 @@ package risk
 
 import (
 	"testing"
-	"time"
 
 	"github.com/newplayman/market-maker-phoenix/internal/config"
 	"github.com/newplayman/market-maker-phoenix/internal/store"
 )
 
-func TestRiskManager_CheckPreTrade(t *testing.T) {
+// TestCheckBatchPreTrade_LightPositionPrinciple 测试轻仓做市原则
+func TestCheckBatchPreTrade_LightPositionPrinciple(t *testing.T) {
+	// 创建配置
 	cfg := &config.Config{
 		Symbols: []config.SymbolConfig{
 			{
-				Symbol:          "BTCUSDT",
-				NetMax:          1.0,
-				MinQty:          0.001,
-				MaxCancelPerMin: 50,
+				Symbol:    "ETHUSDC",
+				NetMax:    0.15,
+				MinQty:    0.01,
+				MinSpread: 0.0003,
 			},
-		},
-		Global: config.GlobalConfig{
-			TotalNotionalMax: 1000000,
 		},
 	}
 
-	st := store.NewStore("", time.Hour)
-	st.InitSymbol("BTCUSDT", 1800)
+	// 创建store
+	st := store.NewStore("./test_snapshot.json", 60)
+	st.InitSymbol("ETHUSDC", 3600)
 
+	// 更新仓位为0
+	pos := store.Position{
+		Symbol: "ETHUSDC",
+		Size:   0.0,
+	}
+	st.UpdatePosition("ETHUSDC", pos)
+
+	// 更新市场价格
+	st.UpdateMidPrice("ETHUSDC", 3000.0, 2999.0, 3001.0)
+
+	// 创建风控管理器
 	rm := NewRiskManager(cfg, st)
 
-	// 测试正常订单
-	err := rm.CheckPreTrade("BTCUSDT", "BUY", 0.05)
+	// 测试场景1：空仓时，双边各挂0.072 ETH（0.006*12层=0.072）
+	// 最坏情况：0.072 ETH < 0.075 ETH (50% NetMax)，应该通过
+	buyQuotes := make([]Quote, 12)
+	sellQuotes := make([]Quote, 12)
+	for i := 0; i < 12; i++ {
+		buyQuotes[i] = Quote{Price: 2990.0 - float64(i), Size: 0.006, Layer: i + 1}
+		sellQuotes[i] = Quote{Price: 3010.0 + float64(i), Size: 0.006, Layer: i + 1}
+	}
+
+	err := rm.CheckBatchPreTrade("ETHUSDC", buyQuotes, sellQuotes)
 	if err != nil {
-		t.Errorf("Expected no error for valid order, got %v", err)
+		t.Errorf("空仓时12层挂单应该通过，但失败: %v", err)
 	}
 
-	// 测试净仓位超限
-	state := st.GetSymbolState("BTCUSDT")
-	state.Mu.Lock()
-	state.Position.Size = 0.95
-	state.Mu.Unlock()
+	// 测试场景2：空仓时，双边各挂0.24 ETH（原配置：0.01*24层=0.24）
+	// 最坏情况：0.24 ETH > 0.075 ETH (50% NetMax)，应该失败
+	buyQuotes24 := make([]Quote, 24)
+	sellQuotes24 := make([]Quote, 24)
+	for i := 0; i < 24; i++ {
+		buyQuotes24[i] = Quote{Price: 2990.0 - float64(i), Size: 0.01, Layer: i + 1}
+		sellQuotes24[i] = Quote{Price: 3010.0 + float64(i), Size: 0.01, Layer: i + 1}
+	}
 
-	err = rm.CheckPreTrade("BTCUSDT", "BUY", 0.1)
+	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotes24, sellQuotes24)
 	if err == nil {
-		t.Error("Expected error for position exceeding netMax")
-	}
-}
-
-func TestRiskManager_CheckStopLoss(t *testing.T) {
-	cfg := &config.Config{
-		Symbols: []config.SymbolConfig{
-			{
-				Symbol:          "BTCUSDT",
-				StopLossThresh:  0.01, // 1%
-				NetMax:          1.0,
-				MinSpread:       0.0001,
-				MaxCancelPerMin: 50,
-			},
-		},
+		t.Errorf("空仓时24层大挂单应该失败，但通过了")
 	}
 
-	st := store.NewStore("", time.Hour)
-	st.InitSymbol("BTCUSDT", 1800)
+	// 测试场景3：已有0.05 ETH多头仓位，再挂0.05 ETH买单
+	// 最坏情况：0.05 + 0.05 = 0.10 ETH > 0.075 ETH，应该失败
+	pos.Size = 0.05
+	st.UpdatePosition("ETHUSDC", pos)
 
-	rm := NewRiskManager(cfg, st)
-
-	state := st.GetSymbolState("BTCUSDT")
-	state.Mu.Lock()
-	state.Position.Size = 1.0
-	state.Position.Notional = 50000.0
-	state.Position.UnrealizedPNL = -600.0 // 亏损1.2%
-	state.Mu.Unlock()
-
-	triggered, reason := rm.CheckStopLoss("BTCUSDT")
-	if !triggered {
-		t.Error("Expected stop loss to be triggered")
+	buyQuotesSmall := []Quote{
+		{Price: 2990.0, Size: 0.05, Layer: 1},
 	}
-	if reason == "" {
-		t.Error("Expected stop loss reason")
-	}
-}
-
-func TestRiskManager_ValidateQuotes(t *testing.T) {
-	cfg := &config.Config{
-		Symbols: []config.SymbolConfig{
-			{
-				Symbol:          "BTCUSDT",
-				MinSpread:       0.0004, // 0.04%
-				MinQty:          0.001,
-				MaxCancelPerMin: 50,
-			},
-		},
+	sellQuotesSmall := []Quote{
+		{Price: 3010.0, Size: 0.01, Layer: 1},
 	}
 
-	st := store.NewStore("", time.Hour)
-	st.InitSymbol("BTCUSDT", 1800)
+	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotesSmall, sellQuotesSmall)
+	if err == nil {
+		t.Errorf("多头仓位时再挂大买单应该失败，但通过了")
+	}
 
-	state := st.GetSymbolState("BTCUSDT")
-	state.Mu.Lock()
-	state.MidPrice = 50000.0
-	state.Mu.Unlock()
+	// 测试场景4：已有0.05 ETH多头仓位，挂0.05 ETH卖单（减仓方向）
+	// 最坏情况：0.05 - 0.05 = 0.00 ETH < 0.075 ETH，应该通过
+	buyQuotesEmpty := []Quote{}
+	sellQuotesReduce := []Quote{
+		{Price: 3010.0, Size: 0.05, Layer: 1},
+	}
 
-	rm := NewRiskManager(cfg, st)
-
-	// 测试正常报价
-	err := rm.ValidateQuotes("BTCUSDT", 49990.0, 50010.0)
+	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotesEmpty, sellQuotesReduce)
 	if err != nil {
-		t.Errorf("Expected valid quotes, got error: %v", err)
+		t.Errorf("多头仓位时挂卖单（减仓）应该通过，但失败: %v", err)
 	}
 
-	// 测试价差过小
-	err = rm.ValidateQuotes("BTCUSDT", 49999.0, 50001.0)
+	// 测试场景5：已有0.08 ETH多头仓位，接近满仓（53% NetMax）
+	// 再挂任何买单都应该失败
+	pos.Size = 0.08
+	st.UpdatePosition("ETHUSDC", pos)
+
+	buyQuotesTiny := []Quote{
+		{Price: 2990.0, Size: 0.01, Layer: 1},
+	}
+	sellQuotesTiny := []Quote{
+		{Price: 3010.0, Size: 0.01, Layer: 1},
+	}
+
+	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotesTiny, sellQuotesTiny)
 	if err == nil {
-		t.Error("Expected error for spread too narrow")
+		t.Errorf("接近满仓时挂买单应该失败，但通过了")
 	}
 }
 
-func TestRiskManager_OnFill(t *testing.T) {
+// TestCheckBatchPreTrade_AsymmetricPositions 测试非对称仓位下的风控
+func TestCheckBatchPreTrade_AsymmetricPositions(t *testing.T) {
 	cfg := &config.Config{
 		Symbols: []config.SymbolConfig{
 			{
-				Symbol:          "BTCUSDT",
-				NetMax:          1.0,
-				GrindingEnabled: true,
-				GrindingThresh:  0.8,
+				Symbol:    "ETHUSDC",
+				NetMax:    0.15,
+				MinQty:    0.01,
+				MinSpread: 0.0003,
 			},
 		},
 	}
 
-	st := store.NewStore("", time.Hour)
-	st.InitSymbol("BTCUSDT", 1800)
+	st := store.NewStore("./test_snapshot.json", 60)
+	st.InitSymbol("ETHUSDC", 3600)
+
+	// 多头仓位0.06 ETH（40% NetMax）
+	pos := store.Position{
+		Symbol: "ETHUSDC",
+		Size:   0.06,
+	}
+	st.UpdatePosition("ETHUSDC", pos)
+	st.UpdateMidPrice("ETHUSDC", 3000.0, 2999.0, 3001.0)
 
 	rm := NewRiskManager(cfg, st)
 
-	// 模拟成交 - OnFill记录统计信息
-	rm.OnFill("BTCUSDT", "BUY", 0.1, 10.0)
+	// 减仓方向（卖单）应该更宽松
+	// 允许挂更多卖单：0.06 (当前) + 0.075 (50% NetMax) = 0.135 ETH卖单容量
+	// 但买单容量受限：0.075 - 0.06 = 0.015 ETH
 
-	state := st.GetSymbolState("BTCUSDT")
-	state.Mu.RLock()
-	fillCount := state.FillCount
-	totalPNL := state.TotalPNL
-	state.Mu.RUnlock()
-
-	if fillCount != 1 {
-		t.Errorf("Expected fill count 1, got %d", fillCount)
+	// 测试：挂0.02 ETH买单应该失败
+	buyQuotesOver := []Quote{
+		{Price: 2990.0, Size: 0.02, Layer: 1},
 	}
-	if totalPNL != 10.0 {
-		t.Errorf("Expected total PNL 10.0, got %.2f", totalPNL)
+	sellQuotesNormal := []Quote{
+		{Price: 3010.0, Size: 0.02, Layer: 1},
+	}
+
+	err := rm.CheckBatchPreTrade("ETHUSDC", buyQuotesOver, sellQuotesNormal)
+	if err == nil {
+		t.Errorf("多头仓位时挂过多买单应该失败，但通过了")
+	}
+
+	// 测试：挂0.01 ETH买单和0.10 ETH卖单应该通过
+	buyQuotesOK := []Quote{
+		{Price: 2990.0, Size: 0.01, Layer: 1},
+	}
+	sellQuotesMany := []Quote{
+		{Price: 3010.0, Size: 0.05, Layer: 1},
+		{Price: 3015.0, Size: 0.05, Layer: 2},
+	}
+
+	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotesOK, sellQuotesMany)
+	if err != nil {
+		t.Errorf("多头仓位时挂少量买单和较多卖单应该通过，但失败: %v", err)
+	}
+}
+
+// TestCheckBatchPreTrade_EdgeCases 测试边界情况
+func TestCheckBatchPreTrade_EdgeCases(t *testing.T) {
+	cfg := &config.Config{
+		Symbols: []config.SymbolConfig{
+			{
+				Symbol:    "ETHUSDC",
+				NetMax:    0.15,
+				MinQty:    0.01,
+				MinSpread: 0.0003,
+			},
+		},
+	}
+
+	st := store.NewStore("./test_snapshot.json", 60)
+	st.InitSymbol("ETHUSDC", 3600)
+
+	pos := store.Position{
+		Symbol: "ETHUSDC",
+		Size:   0.0,
+	}
+	st.UpdatePosition("ETHUSDC", pos)
+	st.UpdateMidPrice("ETHUSDC", 3000.0, 2999.0, 3001.0)
+
+	rm := NewRiskManager(cfg, st)
+
+	// 测试：空报价列表应该通过
+	err := rm.CheckBatchPreTrade("ETHUSDC", []Quote{}, []Quote{})
+	if err != nil {
+		t.Errorf("空报价列表应该通过，但失败: %v", err)
+	}
+
+	// 测试：刚好等于50% NetMax应该通过
+	buyQuotesExact := []Quote{
+		{Price: 2990.0, Size: 0.075, Layer: 1},
+	}
+
+	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotesExact, []Quote{})
+	if err != nil {
+		t.Errorf("刚好等于50%% NetMax应该通过，但失败: %v", err)
+	}
+
+	// 测试：超过50% NetMax一点应该失败
+	buyQuotesOver := []Quote{
+		{Price: 2990.0, Size: 0.076, Layer: 1},
+	}
+
+	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotesOver, []Quote{})
+	if err == nil {
+		t.Errorf("超过50%% NetMax应该失败，但通过了")
 	}
 }

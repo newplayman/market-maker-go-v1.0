@@ -1,0 +1,84 @@
+# Phoenix v2 实盘配置 - ETHUSDC Maker免费策略
+# 测试资金: 190 USDC, 20X杠杆
+
+global:
+  # ==================== 网络配置 ====================
+  testnet: false                            # 实盘模式
+  
+  # ==================== 风控配置 ====================
+  total_notional_max: 180.0                 # 总名义价值上限 180 (190 USDC测试资金)
+  
+  # ==================== 报价配置 ====================
+  quote_interval_ms: 1000                   # 报价间隔 1000ms (1秒，降低撤单频率)
+  
+  # ==================== 监控配置 ====================
+  metrics_port: 9090                        # Prometheus监控端口
+  
+  # ==================== 持久化配置 ====================
+  snapshot_path: "./data/snapshot_mainnet.json"  # 实盘快照路径
+  snapshot_interval: 60                           # 快照间隔60秒
+  
+  # ==================== 日志配置 ====================
+  log_level: "info"                         # 日志级别
+
+# ==================== 交易对配置 ====================
+# ETHUSDC永续合约 - Maker免手续费策略
+symbols:
+  - symbol: "ETHUSDC"                       # 交易对
+    
+    # 仓位限制（适配190 USDC资金，20X杠杆）
+    # 调整为0.30以支持36层完整挂单（36×0.007=0.252，需要0.30×50%=0.15容量）
+    net_max: 0.30                           # 最大净仓位 0.30 ETH (~900 USDC @ 3000U)
+    
+    # 价差配置
+    min_spread: 0.0007                      # 最小价差 0.07%
+
+    # 价格和数量精度
+    tick_size: 0.01                         # 价格最小变动 $0.01
+    min_qty: 0.001                          # 最小下单量 0.001 ETH
+    
+    # ====================【新】统一几何网格配置====================
+    # 买卖各18层，共36层订单
+    # 资金占用：36层 × 21U/层 = 756U名义价值 = 37.8U保证金（19.9%资金占用，@20X杠杆）
+    total_layers: 18                        # 单边层数 18（共36层）
+    unified_layer_size: 0.007               # 统一层大小 0.007 ETH ≈ 21U @ 3000价格
+    grid_start_offset: 1.2                  # 第1层距离mid 1.2 USDT
+    grid_first_spacing: 1.2                 # 第1-2层间距 1.2 USDT
+    grid_spacing_multiplier: 1.15           # 几何系数 1.15（每层间距×1.15）
+    grid_max_spacing: 25.0                  # 最大层间距 25 USDT
+    
+    # 计算示例（@mid=3000 USDT）：
+    # 层1: 距mid 1.2U，买价=2998.8，卖价=3001.2
+    # 层2: 距mid 1.2+1.2=2.4U，买价=2997.6，卖价=3002.4
+    # 层3: 距mid 2.4+1.2*1.15=3.78U，买价=2996.22，卖价=3003.78
+    # 层4: 距mid 3.78+1.2*1.15²=5.365U
+    # ...
+    # 层18: 距mid约100-120U（最后几层间距被限制在25U）
+    
+    # ====================【废弃】旧配置（保留兼容性）====================
+    # 以下参数仅在未配置新参数时生效
+    base_layer_size: 0.01                   # 废弃：使用unified_layer_size
+    near_layers: 8                          # 废弃：使用total_layers
+    far_layers: 16                          # 废弃：使用total_layers
+    far_layer_size: 0.01                    # 废弃：使用unified_layer_size
+    near_layer_start_offset: 0.0004         # 废弃
+    near_layer_spacing_ratio: 1.35          # 废弃
+    far_layer_start_offset: 0.0015          # 废弃
+    far_layer_end_offset: 0.025             # 废弃
+    layer_spacing_mode: geometric           # 废弃
+    spacing_ratio: 1.1                      # 废弃
+    
+    # ====================Pinning/Grinding配置====================
+    pinning_enabled: true                   # 启用钉子模式
+    pinning_thresh: 0.5                     # 50% NetMax触发（0.15 ETH，原文档70%但配置验证最小50%）
+    grinding_enabled: true                  # 启用磨仓模式
+    grinding_thresh: 0.7                    # 70% NetMax触发（0.21 ETH，原文档87%但配置验证最小70%）
+    
+    # 止损配置
+    stop_loss_thresh: 0.05                  # 止损阈值 5%
+    
+    # 撤单限制
+    max_cancel_per_min: 50                  # 每分钟最大撤单数 (符合文档规范)
+    
+    # 库存偏移系数（ASMM策略参数）
+    inventory_skew_coeff: 0.002             # 库存偏移系数（默认0.002）
