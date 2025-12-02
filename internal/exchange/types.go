@@ -77,6 +77,7 @@ type Exchange interface {
 	// Position management
 	GetPosition(ctx context.Context, symbol string) (*Position, error)
 	GetAllPositions(ctx context.Context) ([]*Position, error)
+	GetAccountBalance(ctx context.Context) (float64, float64, error) // TotalWalletBalance, TotalUnrealizedPNL
 
 	// Market data
 	GetFundingRate(ctx context.Context, symbol string) (*FundingRate, error)

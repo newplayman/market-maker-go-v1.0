@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Phoenix Trading Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Phoenix Trading Dashboard</h1>
+            <div class="status-panel">
+                <span id="status-indicator" class="status stopped">STOPPED</span>
+                <span id="pid-display">PID: -</span>
+                <button id="btn-start" onclick="startProcess()">Start</button>
+                <button id="btn-stop" onclick="stopProcess()">Stop</button>
+            </div>
+        </header>
+
+        <main>
+            <!-- Account Overview -->
+            <section class="card-grid">
+                <div class="card highlight-card">
+                    <h3>Net Value (Est.)</h3>
+                    <div class="value" id="val-net-value">$0.00</div>
+                </div>
+                <div class="card highlight-card">
+                    <h3>Total PnL</h3>
+                    <div class="value" id="val-total-pnl">$0.00</div>
+                </div>
+                <div class="card">
+                    <h3>Position Size</h3>
+                    <div class="value" id="val-position">0.000</div>
+                </div>
+                <div class="card">
+                    <h3>Entry Price</h3>
+                    <div class="value" id="val-entry-price">$0.00</div>
+                </div>
+            </section>
+
+            <!-- Trading Overview -->
+            <section class="card-grid">
+                <div class="card">
+                    <h3>Active Orders</h3>
+                    <div class="value" id="val-active-orders">0</div>
+                </div>
+                <div class="card">
+                    <h3>Orders/Min</h3>
+                    <div class="value" id="val-orders-min">0</div>
+                </div>
+                <div class="card">
+                    <h3>Total Placed</h3>
+                    <div class="value" id="val-total-placed">0</div>
+                </div>
+                <div class="card">
+                    <h3>Total Canceled</h3>
+                    <div class="value" id="val-total-canceled">0</div>
+                </div>
+            </section>
+
+            <div class="dashboard-row">
+                <!-- Charts -->
+                <div class="card">
+                    <h2>Price vs Cost</h2>
+                    <div class="chart-container">
+                        <canvas id="priceChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>Trade History</h2>
+                    <div style="overflow-x: auto;">
+                        <table id="tradeTable" style="width: 100%; border-collapse: collapse; margin-top: 10px;">
+                            <thead>
+                                <tr style="text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);">
+                                    <th style="padding: 8px;">Time</th>
+                                    <th style="padding: 8px;">Symbol</th>
+                                    <th style="padding: 8px;">Side</th>
+                                    <th style="padding: 8px;">Price</th>
+                                    <th style="padding: 8px;">Qty</th>
+                                    <th style="padding: 8px;">PnL</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <!-- Rows will be added here -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="dashboard-row">
+                <div class="card chart-card">
+                    <h3>Order Activity</h3>
+                    <div class="chart-container">
+                        <canvas id="chart-activity"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <div class="dashboard-row">
+                <!-- Risk & Events -->
+                <div class="card event-log-card" style="grid-column: span 2;">
+                    <h3>Recent Events</h3>
+                    <div id="event-log" class="log-window">
+                        <!-- Events will be injected here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Config Editor -->
+            <section class="card">
+                <h3>Configuration (phoenix_live.yaml)</h3>
+                <textarea id="config-editor" spellcheck="false"></textarea>
+                <div class="actions">
+                    <button onclick="saveConfig()">Save Config</button>
+                    <button onclick="loadConfig()">Reload</button>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="app.js"></script>
+</body>
+
+</html>

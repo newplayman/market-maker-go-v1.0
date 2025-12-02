@@ -58,6 +58,33 @@ func (r *RiskManager) CheckPreTrade(symbol string, side string, size float64) er
 		newPos = currentPos - size
 	}
 
+	// 【修复1】先检查当前持仓是否已经超标 - 这是最关键的防线
+	// 如果持仓已超标，只允许减仓，严格禁止任何开仓操作
+	if math.Abs(currentPos) > symCfg.NetMax {
+		isReducing := (currentPos > 0 && side == "SELL") || (currentPos < 0 && side == "BUY")
+		if !isReducing {
+			log.Error().
+				Str("symbol", symbol).
+				Float64("current_pos", currentPos).
+				Float64("net_max", symCfg.NetMax).
+				Float64("pos_ratio", math.Abs(currentPos)/symCfg.NetMax*100).
+				Str("side", side).
+				Float64("size", size).
+				Msg("持仓已超标，禁止继续开仓")
+			return fmt.Errorf("持仓%.4f已超netMax%.4f(%.1f%%)，禁止继续开仓",
+				math.Abs(currentPos), symCfg.NetMax, math.Abs(currentPos)/symCfg.NetMax*100)
+		}
+		// 仅允许减仓，记录警告日志
+		log.Warn().
+			Str("symbol", symbol).
+			Float64("current_pos", currentPos).
+			Float64("net_max", symCfg.NetMax).
+			Float64("pos_ratio", math.Abs(currentPos)/symCfg.NetMax*100).
+			Str("side", side).
+			Float64("size", size).
+			Msg("持仓超标，仅允许减仓操作")
+	}
+
 	// 检查是否处于Grinding模式
 	isGrindingMode := symCfg.GrindingEnabled && math.Abs(currentPos)/symCfg.NetMax > symCfg.GrindingThresh
 	isReducingPosition := (currentPos > 0 && side == "SELL") || (currentPos < 0 && side == "BUY")

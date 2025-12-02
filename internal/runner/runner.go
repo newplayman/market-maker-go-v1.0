@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sync"
@@ -126,6 +127,36 @@ func (r *Runner) Stop() {
 func (r *Runner) runSymbol(ctx context.Context, symbol string) {
 	defer r.wg.Done()
 
+	// 【关键修复】添加Panic恢复机制，防止单个goroutine崩溃导致假死
+	defer func() {
+		if err := recover(); err != nil {
+			log.Error().
+				Interface("panic", err).
+				Str("symbol", symbol).
+				Str("stack", fmt.Sprintf("%v", err)).
+				Msg("【严重】runSymbol发生panic！尝试恢复...")
+
+			// 记录panic到metrics
+			metrics.RecordError("goroutine_panic", symbol)
+
+			// 等待5秒后尝试重启该goroutine
+			time.Sleep(5 * time.Second)
+
+			// 检查是否已经停止
+			r.mu.Lock()
+			stopped := r.stopped
+			r.mu.Unlock()
+
+			if !stopped {
+				log.Warn().
+					Str("symbol", symbol).
+					Msg("重新启动runSymbol goroutine")
+				r.wg.Add(1)
+				go r.runSymbol(ctx, symbol)
+			}
+		}
+	}()
+
 	log.Info().Str("symbol", symbol).Msg("启动交易对做市循环")
 
 	ticker := time.NewTicker(r.cfg.GetQuoteInterval())
@@ -181,6 +212,13 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 		}
 	}
 
+	// 【新增】同步当前本地订单状态（从exchange拉取）
+	// 必须在检查溢出前同步，否则一旦溢出就会因状态无法更新而陷入死循环
+	if err := r.om.SyncActiveOrders(ctx, symbol); err != nil {
+		log.Error().Err(err).Str("symbol", symbol).Msg("同步活跃订单失败")
+		return err
+	}
+
 	// 订单溢出熔断阈值
 	const orderOverflowThreshold = 50
 
@@ -200,6 +238,30 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 
 		// 停止该策略的做市循环 (返回错误停止本轮交易)
 		return fmt.Errorf("订单数量溢出(%d)，触发紧急撤单", activeOrdersCount)
+	}
+
+	// 【关键修复】检查价格数据新鲜度 - 防止WebSocket静默断流导致假死
+	// 将阈值从10秒降低到3秒，更快检测异常
+	state := r.store.GetSymbolState(symbol)
+	if state != nil {
+		state.Mu.RLock()
+		lastUpdate := state.LastPriceUpdate
+		midPrice := state.MidPrice
+		state.Mu.RUnlock()
+
+		// 如果价格从未更新（刚启动且WSS未推）或超过3秒未更新
+		if lastUpdate.IsZero() || time.Since(lastUpdate) > 3*time.Second {
+			log.Error().
+				Str("symbol", symbol).
+				Time("last_update", lastUpdate).
+				Dur("stale_duration", time.Since(lastUpdate)).
+				Float64("mid", midPrice).
+				Msg("【告警】价格数据过期，停止报价！WebSocket可能断流")
+			
+			// 记录错误到metrics
+			metrics.RecordError("stale_price_data", symbol)
+			return nil
+		}
 	}
 
 	// 1. 检查止损
@@ -229,14 +291,14 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 			cancelCount := state.CancelCountLast
 			state.Mu.RUnlock()
 
-			// 当撤单数接近限制的95%时，记录警告（不跳过报价）
+			// 当撤单数接近限制的95%时，暂停更新以保护账户
 			if cancelCount >= int(float64(symCfg.MaxCancelPerMin)*0.95) {
 				log.Warn().
 					Str("symbol", symbol).
 					Int("cancel_count", cancelCount).
 					Int("limit", symCfg.MaxCancelPerMin).
-					Msg("撤单频率接近限制，请注意风险（不跳过报价）")
-				// 不返回，继续执行
+					Msg("撤单频率过高，暂停本轮报价更新（保持现有挂单）")
+				return nil
 			}
 		}
 	}
@@ -401,11 +463,8 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 		})
 	}
 
-	// 8. 同步当前本地订单状态（从exchange拉取）
-	if err := r.om.SyncActiveOrders(ctx, symbol); err != nil {
-		log.Error().Err(err).Str("symbol", symbol).Msg("同步活跃订单失败")
-		return err
-	}
+	// 8. 同步当前本地订单状态（已移至函数开头）
+	// if err := r.om.SyncActiveOrders(ctx, symbol); err != nil { ... }
 
 	// 9. 计算订单差分，获取待撤销和待新增订单
 	symCfg = r.cfg.GetSymbolConfig(symbol)
@@ -413,7 +472,7 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 	// 计算防闪烁容差 (Anti-Flicker Tolerance)
 	// 【关键】容差决定了何时撤单重挂，容差越大，撤单频率越低
 	// 策略：使用第一层间距作为基准，容差设为其50-80%
-	state := r.store.GetSymbolState(symbol)
+	state = r.store.GetSymbolState(symbol)
 	tolerance := symCfg.TickSize * 5 // 默认最小容差: 5个tick (0.05 USDT)
 
 	if state != nil && state.MidPrice > 0 {
@@ -637,6 +696,19 @@ func (r *Runner) onOrderUpdate(order *gateway.Order) {
 		pnl := 0.0
 		r.store.RecordFill(order.Symbol, order.FilledQty, pnl)
 		metrics.RecordFill(order.Symbol, order.Side, order.FilledQty)
+
+		// Log structured TRADE_EVENT for dashboard
+		tradeEvent := map[string]interface{}{
+			"type":      "TRADE",
+			"symbol":    order.Symbol,
+			"side":      order.Side,
+			"price":     order.Price,
+			"quantity":  order.FilledQty,
+			"pnl":       pnl,
+			"timestamp": time.Now().Unix(),
+		}
+		jsonBytes, _ := json.Marshal(tradeEvent)
+		log.Info().RawJSON("trade_data", jsonBytes).Msg("TRADE_EVENT")
 	}
 }
 
@@ -686,9 +758,37 @@ func (r *Runner) onFundingUpdate(funding *gateway.FundingRate) {
 func (r *Runner) runGlobalMonitor(ctx context.Context) {
 	defer r.wg.Done()
 
-	ticker := time.NewTicker(10 * time.Second)
+	// 【关键修复】添加Panic恢复机制
+	defer func() {
+		if err := recover(); err != nil {
+			log.Error().
+				Interface("panic", err).
+				Str("stack", fmt.Sprintf("%v", err)).
+				Msg("【严重】runGlobalMonitor发生panic！尝试恢复...")
+
+			// 记录panic到metrics
+			metrics.RecordError("monitor_panic", "global")
+
+			// 等待5秒后尝试重启
+			time.Sleep(5 * time.Second)
+
+			// 检查是否已经停止
+			r.mu.Lock()
+			stopped := r.stopped
+			r.mu.Unlock()
+
+			if !stopped {
+				log.Warn().Msg("重新启动runGlobalMonitor goroutine")
+				r.wg.Add(1)
+				go r.runGlobalMonitor(ctx)
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	log.Info().Msg("Global monitor started")
 	for {
 		select {
 		case <-ctx.Done():
@@ -696,7 +796,9 @@ func (r *Runner) runGlobalMonitor(ctx context.Context) {
 		case <-r.stopChan:
 			return
 		case <-ticker.C:
+			// log.Info().Msg("Global monitor tick")
 			r.monitorGlobalState()
+			r.logDashboardStats()
 		}
 	}
 }
@@ -714,8 +816,33 @@ func (r *Runner) monitorGlobalState() {
 			Msg("总名义价值超过上限")
 	}
 
-	// 记录所有交易对的风控指标
+	// 【关键修复】检查WebSocket健康度 - 检测静默断流
 	for _, symbol := range r.store.GetAllSymbols() {
+		state := r.store.GetSymbolState(symbol)
+		if state != nil {
+			state.Mu.RLock()
+			lastUpdate := state.LastPriceUpdate
+			midPrice := state.MidPrice
+			state.Mu.RUnlock()
+
+			// 如果深度数据超过5秒未更新，说明WebSocket可能断流
+			if !lastUpdate.IsZero() && time.Since(lastUpdate) > 5*time.Second {
+				log.Error().
+					Str("symbol", symbol).
+					Time("last_update", lastUpdate).
+					Dur("stale_duration", time.Since(lastUpdate)).
+					Float64("last_mid_price", midPrice).
+					Msg("【严重告警】深度数据停止更新，WebSocket可能断流！")
+
+				// 记录错误
+				metrics.RecordError("websocket_stale", symbol)
+
+				// TODO: 可以在这里触发WebSocket重连
+				// r.exchange.ReconnectDepthStream(ctx, symbol)
+			}
+		}
+
+		// 记录所有交易对的风控指标
 		r.risk.LogRiskMetrics(symbol)
 	}
 }
@@ -764,4 +891,43 @@ func (r *Runner) updateSymbolMetrics(symbol string) {
 	metrics.MaxDrawdown.WithLabelValues(symbol).Set(state.MaxDrawdown)
 	metrics.CancelRate.WithLabelValues(symbol).Set(float64(state.CancelCountLast))
 	metrics.TotalPNL.WithLabelValues(symbol).Set(state.TotalPNL)
+}
+
+// logDashboardStats 记录Dashboard所需的结构化统计信息
+// logDashboardStats 记录Dashboard所需的结构化统计信息
+func (r *Runner) logDashboardStats() {
+	// 获取账户余额
+	walletBalance, unrealizedPNL, err := r.exchange.GetAccountBalance(context.Background())
+	if err != nil {
+		log.Error().Err(err).Msg("获取账户余额失败")
+		// 继续执行，使用默认值
+	}
+
+	for _, symbol := range r.store.GetAllSymbols() {
+		state := r.store.GetSymbolState(symbol)
+		if state == nil {
+			continue
+		}
+
+		state.Mu.RLock()
+		stats := map[string]interface{}{
+			"type":           "TICKER",
+			"symbol":         symbol,
+			"mid_price":      state.MidPrice,
+			"position":       state.Position.Size,
+			"entry_price":    state.Position.EntryPrice,
+			"unrealized_pnl": state.Position.UnrealizedPNL,
+			"total_pnl":      state.TotalPNL,
+			"active_orders":  state.ActiveOrderCount,
+			"total_notional": r.store.GetTotalNotional(),
+			"fill_count":     state.FillCount,
+			"wallet_balance": walletBalance,
+			"account_pnl":    unrealizedPNL,
+			"net_value":      walletBalance + unrealizedPNL,
+		}
+		state.Mu.RUnlock()
+
+		jsonBytes, _ := json.Marshal(stats)
+		log.Info().RawJSON("ticker_data", jsonBytes).Msg("TICKER_EVENT")
+	}
 }

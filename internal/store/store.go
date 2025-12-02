@@ -26,15 +26,16 @@ type Position struct {
 type SymbolState struct {
 	Mu sync.RWMutex
 
-	Symbol      string
-	Position    Position
-	PendingBuy  float64   // 挂单买入量
-	PendingSell float64   // 挂单卖出量
-	MidPrice    float64   // 中间价
-	BestBid     float64   // 最优买价
-	BestAsk     float64   // 最优卖价
-	FundingRate float64   // 资金费率
-	LastFill    time.Time // 最后成交时间
+	Symbol          string
+	Position        Position
+	PendingBuy      float64   // 挂单买入量
+	PendingSell     float64   // 挂单卖出量
+	MidPrice        float64   // 中间价
+	BestBid         float64   // 最优买价
+	BestAsk         float64   // 最优卖价
+	FundingRate     float64   // 资金费率
+	LastFill        time.Time // 最后成交时间
+	LastPriceUpdate time.Time // 最后价格更新时间
 
 	// 活跃订单数量统计
 	ActiveOrderCount int // 实际活跃订单数量
@@ -185,6 +186,7 @@ func (s *Store) UpdateMidPrice(symbol string, mid, bestBid, bestAsk float64) {
 	state.MidPrice = mid
 	state.BestBid = bestBid
 	state.BestAsk = bestAsk
+	state.LastPriceUpdate = time.Now()
 
 	// 添加到价格历史
 	state.PriceHistory[state.PriceHistoryIndex] = mid

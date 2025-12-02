@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync"
 
@@ -65,6 +66,29 @@ func (a *ASMM) GenerateQuotes(ctx context.Context, symbol string) ([]Quote, []Qu
 
 	if mid <= 0 {
 		return nil, nil, ErrInvalidMidPrice
+	}
+
+	// 【修复3】紧急熔断机制：持仓超过80% NetMax时停止报价
+	// 这是最后一道防线，防止持仓失控导致强平
+	posRatio := math.Abs(pos) / symCfg.NetMax
+	if posRatio > 0.80 {
+		log.Error().
+			Str("symbol", symbol).
+			Float64("pos", pos).
+			Float64("net_max", symCfg.NetMax).
+			Float64("pos_ratio", posRatio*100).
+			Msg("【紧急熔断】持仓超过80% netMax，停止报价以防止持仓继续扩大")
+		return nil, nil, fmt.Errorf("紧急熔断: 持仓使用率%.1f%%超过80%%阈值，停止报价", posRatio*100)
+	}
+
+	// 如果持仓超过50%，记录警告日志
+	if posRatio > 0.50 {
+		log.Warn().
+			Str("symbol", symbol).
+			Float64("pos", pos).
+			Float64("net_max", symCfg.NetMax).
+			Float64("pos_ratio", posRatio*100).
+			Msg("【风控警告】持仓已超过50% netMax，需要注意风险")
 	}
 
 	// 计算库存偏移

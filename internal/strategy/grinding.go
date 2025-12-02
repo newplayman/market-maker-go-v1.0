@@ -2,6 +2,8 @@ package strategy
 
 import (
 	"math"
+
+	"github.com/rs/zerolog/log"
 )
 
 // GrindingConfig holds grinding mode configuration
@@ -53,12 +55,23 @@ func (a *ASMM) ShouldStartGrinding(symbol string) bool {
 		return false
 	}
 
-	// 检查波动率
+	// 【修复2】放宽波动率限制：从0.38%提高到1%
+	// 原因：市场剧烈波动时更需要grinding来减仓，过于严格的波动率限制会导致风控失效
 	stdDev := a.store.PriceStdDev30m(symbol)
-	if stdDev >= 0.0038 { // 0.38% 波动率阈值
+	if stdDev >= 0.01 { // 1% 波动率阈值（从0.38%放宽）
+		log.Debug().
+			Str("symbol", symbol).
+			Float64("std_dev", stdDev).
+			Float64("position_ratio", positionRatio).
+			Msg("波动率过大，暂不启动grinding")
 		return false // 波动太大，不适合grinding
 	}
 
+	log.Info().
+		Str("symbol", symbol).
+		Float64("position_ratio", positionRatio).
+		Float64("std_dev", stdDev).
+		Msg("触发Grinding模式")
 	return true
 }
 

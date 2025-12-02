@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 
 	gateway "github.com/newplayman/market-maker-phoenix/internal/exchange"
@@ -220,6 +221,21 @@ func ordersMatch(existing, desired *gateway.Order, tolerance float64) bool {
 	return true
 }
 
+// removeActiveOrder 从本地活跃订单列表中移除指定订单
+func (om *OrderManager) removeActiveOrder(symbol, orderID string) {
+	om.mu.Lock()
+	defer om.mu.Unlock()
+
+	orders := om.activeOrders[symbol]
+	newOrders := make([]*gateway.Order, 0, len(orders))
+	for _, o := range orders {
+		if o.ClientOrderID != orderID {
+			newOrders = append(newOrders, o)
+		}
+	}
+	om.activeOrders[symbol] = newOrders
+}
+
 // ApplyDiff 应用订单差分，执行撤单和新单下单
 func (om *OrderManager) ApplyDiff(ctx context.Context, symbol string, toCancel []string, toPlace []*gateway.Order) error {
 	// 【关键修复】限制下单数量，防止订单爆炸
@@ -262,7 +278,14 @@ func (om *OrderManager) ApplyDiff(ctx context.Context, symbol string, toCancel [
 	cancelSuccess := 0
 	for _, orderID := range toCancel {
 		if err := om.exchange.CancelOrder(ctx, symbol, orderID); err != nil {
-			log.Error().Err(err).Str("order_id", orderID).Msg("撤单失败")
+			// 如果是订单不存在错误，视为撤单成功（实际上是清理僵尸订单）
+			if strings.Contains(err.Error(), "Unknown order") || strings.Contains(err.Error(), "-2011") {
+				log.Warn().Str("order_id", orderID).Msg("订单不存在，从本地状态移除")
+				om.removeActiveOrder(symbol, orderID)
+				// 不增加 cancelCount，因为这不是一次有效的撤单消耗
+			} else {
+				log.Error().Err(err).Str("order_id", orderID).Msg("撤单失败")
+			}
 		} else {
 			// 【关键修复】撤单成功后调用计数器
 			om.store.IncrementCancelCount(symbol)

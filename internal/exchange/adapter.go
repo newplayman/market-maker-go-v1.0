@@ -515,3 +515,17 @@ func (h *adapterWSHandler) HandleFundingUpdate(funding *FundingRate) {
 		callbacks.OnFunding(funding)
 	}
 }
+
+// GetAccountBalance returns the total wallet balance and total unrealized PNL
+func (b *BinanceAdapter) GetAccountBalance(ctx context.Context) (float64, float64, error) {
+	if b.restClient == nil {
+		return 0, 0, fmt.Errorf("rest client not available")
+	}
+
+	accountInfo, err := b.restClient.AccountInfo()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return accountInfo.TotalWalletBalance, accountInfo.TotalUnrealizedProfit, nil
+}

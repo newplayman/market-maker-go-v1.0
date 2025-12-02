@@ -215,8 +215,8 @@ func validateConfig(cfg *Config) error {
 		if sym.PinningThresh > 0 && (sym.PinningThresh < 0.5 || sym.PinningThresh > 0.95) {
 			return fmt.Errorf("symbols[%d]: pinning_thresh 必须在 [0.5, 0.95] 之间", i)
 		}
-		if sym.GrindingThresh > 0 && (sym.GrindingThresh < 0.7 || sym.GrindingThresh > 0.98) {
-			return fmt.Errorf("symbols[%d]: grinding_thresh 必须在 [0.7, 0.98] 之间", i)
+		if sym.GrindingThresh > 0 && (sym.GrindingThresh < 0.5 || sym.GrindingThresh > 0.98) {
+			return fmt.Errorf("symbols[%d]: grinding_thresh 必须在 [0.5, 0.98] 之间", i)
 		}
 
 		// 验证止损阈值
