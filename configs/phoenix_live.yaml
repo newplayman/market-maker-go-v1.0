@@ -1,27 +1,33 @@
-# Phoenix v2 实盘配置 - ETHUSDC Maker免费策略
+# Phoenix v2 实盘配置 - 多交易对策略（5个永续合约）
 # 测试资金: 1000 USDC, 20X杠杆
+# 交易对: ETHUSDC, BTCUSDC, SOLUSDC, BNBUSDC, XRPUSDC
 #
-# 【风控修复说明 - 2025-12-02】
-# 1. net_max从1.50降低到0.50 ETH（降低67%），避免单边行情强平
-# 2. grinding_thresh从60%降低到30%，更早启动减仓机制
-# 3. 代码层面增加：
-#    - 持仓绝对值检查（超标只允许减仓）
-#    - 紧急熔断机制（80%持仓使用率停止报价）
-#    - grinding波动率限制放宽（0.38%→1%）
-#    - 50%持仓使用率警告日志
+# 【多交易对资金分配 - 2025-12-02】
+# 总保证金需求: 187.5 USDC (18.75%资金使用率)
+# - ETHUSDC: 75 USDC (35%权重)
+# - BTCUSDC: 31.5 USDC (30%权重)
+# - SOLUSDC: 36 USDC (20%权重)
+# - BNBUSDC: 30 USDC (10%权重)
+# - XRPUSDC: 15 USDC (5%权重)
 #
-# 风控触发点（基于net_max=0.50 ETH, @2800价格）：
-# - 30%触发grinding（0.15 ETH = 420 USDC名义 = 21 USDC保证金 = 2.1%资金）
-# - 50%触发pinning + 警告（0.25 ETH = 700 USDC名义 = 35 USDC保证金 = 3.5%资金）
-# - 80%触发熔断（0.40 ETH = 1120 USDC名义 = 56 USDC保证金 = 5.6%资金）
-# - 100%强制只允许减仓（0.50 ETH = 1400 USDC名义 = 70 USDC保证金 = 7%资金）
+# 【关键限制调整】
+# 1. max_cancel_per_min: 200 → 40 (每个交易对)
+#    原因: 币安全局限制200次/分钟，5个交易对共享
+# 2. total_notional_max: 1000 → 4000
+#    原因: 5个交易对总名义价值约3750 USDC
+#
+# 【风控触发点】(以ETHUSDC为例，net_max=0.50 ETH, @3000价格)
+# - 50%触发pinning（0.25 ETH = 750 USDC名义）
+# - 60%触发grinding（0.30 ETH = 900 USDC名义）
+# - 80%触发熔断（0.40 ETH = 1200 USDC名义）
+# - 100%强制只允许减仓（0.50 ETH = 1500 USDC名义）
 
 global:
   # ==================== 网络配置 ====================
   testnet: false                            # 实盘模式
   
   # ==================== 风控配置 ====================
-  total_notional_max: 1000.0                 # 总名义价值上限 180 (190 USDC测试资金)
+  total_notional_max: 4000.0                 # 总名义价值上限 4000 (支持5个交易对)
   
   # ==================== 报价配置 ====================
   quote_interval_ms: 1000                   # 报价间隔 1000ms (1秒，降低撤单频率)
@@ -37,81 +43,244 @@ global:
   log_level: "info"                         # 日志级别
 
 # ==================== 交易对配置 ====================
-# ETHUSDC永续合约 - Maker免手续费策略
+# 5个永续合约同时运行，每个14层挂单
 symbols:
-  - symbol: "ETHUSDC"                       # 交易对
+  # ==============================================
+  # 1. ETHUSDC (35%权重, 75U保证金)
+  # ==============================================
+  - symbol: "ETHUSDC"
+    net_max: 0.50                           # 0.50 ETH @ 3000 = 1500名义 = 75U保证金
+    min_spread: 0.0007                      # 0.07%价差
+    tick_size: 0.01                         # $0.01最小变动
+    min_qty: 0.005                          # 0.005 ETH最小量
     
-    # 【修复4】仓位限制（适配1000 USDC资金，20X杠杆）
-    # 降低到0.50 ETH以保护本金安全，避免单边行情导致强平
-    # 计算：0.50 ETH × 2800价格 = 1400 USDC名义值 = 70 USDC保证金（7%资金使用率）
-    net_max: 0.50                           # 最大净仓位 0.50 ETH (从1.50降低到0.50，提高安全性)
-    
-    # 价差配置
-    min_spread: 0.0007                      # 最小价差 0.07%
-
-    # 价格和数量精度
-    tick_size: 0.01                         # 价格最小变动 $0.01
-    min_qty: 0.005                          # 最小下单量 0.001 ETH
-    
-    # ====================【新】统一几何网格配置====================
-    # 买卖各7层，共14层订单
-    # 资金占用：14层 × 96.25U/层 = 1347.5U名义价值 = 67.4U保证金（6.74%资金占用，@20X杠杆）
-    # 批量风控限制：net_max × 0.5 = 0.50 × 0.5 = 0.25 ETH
-    # 实际挂单总量：7 × 0.035 = 0.245 ETH < 0.25 ETH ✅ 通过风控
-    total_layers: 7                         # 单边层数 7（共14层订单）
-    unified_layer_size: 0.035               # 统一层大小 0.035 ETH ≈ 96.25U @ 2750价格
-    grid_start_offset: 1.2                  # 第1层距离mid 1.2 USDT
-    grid_first_spacing: 1.2                 # 第1-2层间距 1.2 USDT
-    grid_spacing_multiplier: 1.15           # 几何系数 1.15（每层间距×1.15）
+    # 网格配置
+    total_layers: 7                         # 单边7层
+    unified_layer_size: 0.035               # 0.035 ETH ≈ 105U
+    grid_start_offset: 1.2                  # 第1层距mid 1.2 USDT
+    grid_first_spacing: 1.2                 # 层间距起始 1.2 USDT
+    grid_spacing_multiplier: 1.15           # 几何增长系数
     grid_max_spacing: 25.0                  # 最大层间距 25 USDT
     
-    # 计算示例（@mid=3000 USDT）：
-    # 层1: 距mid 1.2U，买价=2998.8，卖价=3001.2
-    # 层2: 距mid 1.2+1.2=2.4U，买价=2997.6，卖价=3002.4
-    # 层3: 距mid 2.4+1.2*1.15=3.78U，买价=2996.22，卖价=3003.78
-    # 层4: 距mid 3.78+1.2*1.15²=5.365U
-    # 层5: 距mid 5.365+1.2*1.15³=6.89U
-    # 层6: 距mid 6.89+1.2*1.15⁴=8.62U
-    # 层7: 距mid 8.62+1.2*1.15⁵=10.57U（最后一层）
+    # 风控配置
+    pinning_enabled: true
+    pinning_thresh: 0.50                    # 50%触发pinning
+    grinding_enabled: true
+    grinding_thresh: 0.60                   # 60%触发grinding
+    stop_loss_thresh: 0.05                  # 5%止损
+    max_cancel_per_min: 40                  # ⚠️ 降至40（5交易对共享200限制）
+    inventory_skew_coeff: 0.002
+    vol_smoothing_alpha: 0.02
     
-    # ====================【废弃】旧配置（保留兼容性）====================
-    # 以下参数仅在未配置新参数时生效
-    base_layer_size: 0.01                   # 废弃：使用unified_layer_size
-    near_layers: 8                          # 废弃：使用total_layers
-    far_layers: 16                          # 废弃：使用total_layers
-    far_layer_size: 0.01                    # 废弃：使用unified_layer_size
-    near_layer_start_offset: 0.0004         # 废弃
-    near_layer_spacing_ratio: 1.35          # 废弃
-    far_layer_start_offset: 0.0015          # 废弃
-    far_layer_end_offset: 0.025             # 废弃
-    layer_spacing_mode: geometric           # 废弃
-    spacing_ratio: 1.1                      # 废弃
+    # VPIN配置
+    vpin_enabled: true
+    vpin_bucket_size: 50000
+    vpin_num_buckets: 50
+    vpin_threshold: 0.7
+    vpin_pause_thresh: 0.9
+    vpin_multiplier: 0.2
+    vpin_vol_threshold: 100000
     
-    # ====================Pinning/Grinding配置====================
-    # 【修复2】配置约束：pinning_thresh ∈ [0.5, 0.95]，grinding_thresh > pinning_thresh
-    # 由于配置验证限制，无法将阈值降得更低，但配合代码层面的修复仍能大幅提升安全性
-    pinning_enabled: true                   # 启用钉子模式
-    pinning_thresh: 0.50                    # 50% NetMax触发（0.25 ETH = 700 USDC @ 2800价格）
-    grinding_enabled: true                  # 启用磨仓模式
-    grinding_thresh: 0.60                   # 60% NetMax触发（0.30 ETH = 840 USDC @ 2800价格）
-                                            # 保持原值，但波动率限制已放宽到1%，更容易触发
+    # 兼容旧参数
+    base_layer_size: 0.01
+    near_layers: 8
+    far_layers: 16
+    far_layer_size: 0.01
+    near_layer_start_offset: 0.0004
+    near_layer_spacing_ratio: 1.35
+    far_layer_start_offset: 0.0015
+    far_layer_end_offset: 0.025
+    layer_spacing_mode: geometric
+    spacing_ratio: 1.1
+
+  # ==============================================
+  # 2. BTCUSDC (30%权重, 31.5U保证金)
+  # ==============================================
+  - symbol: "BTCUSDC"
+    net_max: 0.015                          # 0.015 BTC @ 42000 = 630名义 = 31.5U保证金
+    min_spread: 0.001                       # 0.1%价差（修复：增加以通过验证）
+    tick_size: 0.1                          # $0.1最小变动
+    min_qty: 0.001                          # 0.001 BTC最小量
     
-    # 止损配置
-    stop_loss_thresh: 0.05                  # 止损阈值 5%
+    # 网格配置
+    total_layers: 7
+    unified_layer_size: 0.001               # 0.001 BTC ≈ 90U (修复：降低以通过风控)
+    grid_start_offset: 40.0                 # 第1层距mid 40 USDT（增加以满足min_spread）
+    grid_first_spacing: 40.0                # 层间距起始 40 USDT
+    grid_spacing_multiplier: 1.15
+    grid_max_spacing: 200.0                 # BTC波动大，最大间距200
     
-    # 撤单限制
-    max_cancel_per_min: 200                 # 每分钟最大撤单数 (已调整为200以适配36层网格)
+    # 风控配置
+    pinning_enabled: true
+    pinning_thresh: 0.50
+    grinding_enabled: true
+    grinding_thresh: 0.60
+    stop_loss_thresh: 0.05
+    max_cancel_per_min: 40
+    inventory_skew_coeff: 0.002
+    vol_smoothing_alpha: 0.02
     
-    # 库存偏移系数（ASMM策略参数）
-    inventory_skew_coeff: 0.002             # 库存偏移系数（默认0.002）
+    # VPIN配置（BTC流动性好，bucket更大）
+    vpin_enabled: true
+    vpin_bucket_size: 100000
+    vpin_num_buckets: 50
+    vpin_threshold: 0.7
+    vpin_pause_thresh: 0.9
+    vpin_multiplier: 0.2
+    vpin_vol_threshold: 200000
     
-    # ====================VPIN配置（订单流毒性检测）====================
-    # VPIN (Volume-Synchronized Probability of Informed Trading)
-    # 用于检测订单流毒性，防止被知情交易者猎杀
-    vpin_enabled: true                      # 是否启用VPIN（已启用）
-    vpin_bucket_size: 50000                 # Bucket大小（成交量，默认50000）
-    vpin_num_buckets: 50                    # Bucket数量（默认50）
-    vpin_threshold: 0.7                     # 警报阈值（>0.7扩大价差20%）
-    vpin_pause_thresh: 0.9                  # 暂停阈值（>0.9暂停报价5秒）
-    vpin_multiplier: 0.2                    # Spread放大系数（默认0.2=20%）
-    vpin_vol_threshold: 100000              # 最小总成交量要求（默认100000）
+    # 兼容旧参数
+    base_layer_size: 0.001
+    near_layers: 8
+    far_layers: 16
+    far_layer_size: 0.001
+    near_layer_start_offset: 0.0004
+    near_layer_spacing_ratio: 1.35
+    far_layer_start_offset: 0.0015
+    far_layer_end_offset: 0.025
+    layer_spacing_mode: geometric
+    spacing_ratio: 1.1
+
+  # ==============================================
+  # 3. SOLUSDC (20%权重, 36U保证金)
+  # ==============================================
+  - symbol: "SOLUSDC"
+    net_max: 6.0                            # 6 SOL @ 120 = 720名义 = 36U保证金
+    min_spread: 0.001                       # 0.1%价差（SOL波动大）
+    tick_size: 0.01                         # $0.01最小变动
+    min_qty: 0.01                           # 0.01 SOL最小量（修复精度）
+    
+    # 网格配置
+    total_layers: 7
+    unified_layer_size: 0.4                 # 0.4 SOL ≈ 56U (修复：降低+调整精度)
+    grid_start_offset: 0.5                  # 第1层距mid 0.5 USDT
+    grid_first_spacing: 0.5                 # 层间距起始 0.5 USDT
+    grid_spacing_multiplier: 1.15
+    grid_max_spacing: 10.0                  # 最大层间距 10 USDT
+    
+    # 风控配置
+    pinning_enabled: true
+    pinning_thresh: 0.50
+    grinding_enabled: true
+    grinding_thresh: 0.60
+    stop_loss_thresh: 0.05
+    max_cancel_per_min: 40
+    inventory_skew_coeff: 0.002
+    vol_smoothing_alpha: 0.02
+    
+    # VPIN配置
+    vpin_enabled: true
+    vpin_bucket_size: 30000
+    vpin_num_buckets: 50
+    vpin_threshold: 0.7
+    vpin_pause_thresh: 0.9
+    vpin_multiplier: 0.2
+    vpin_vol_threshold: 60000
+    
+    # 兼容旧参数
+    base_layer_size: 0.1
+    near_layers: 8
+    far_layers: 16
+    far_layer_size: 0.1
+    near_layer_start_offset: 0.0004
+    near_layer_spacing_ratio: 1.35
+    far_layer_start_offset: 0.0015
+    far_layer_end_offset: 0.025
+    layer_spacing_mode: geometric
+    spacing_ratio: 1.1
+
+  # ==============================================
+  # 4. BNBUSDC (10%权重, 30U保证金)
+  # ==============================================
+  - symbol: "BNBUSDC"
+    net_max: 1.0                            # 1 BNB @ 600 = 600名义 = 30U保证金
+    min_spread: 0.0008                      # 0.08%价差
+    tick_size: 0.1                          # $0.1最小变动（修复：币安BNB精度）
+    min_qty: 0.01                           # 0.01 BNB最小量
+    
+    # 网格配置
+    total_layers: 7
+    unified_layer_size: 0.07                # 0.07 BNB ≈ 61U (修复：降低以通过风控)
+    grid_start_offset: 0.6                  # 第1层距mid 0.6 USDT
+    grid_first_spacing: 0.6                 # 层间距起始 0.6 USDT
+    grid_spacing_multiplier: 1.15
+    grid_max_spacing: 15.0                  # 最大层间距 15 USDT
+    
+    # 风控配置
+    pinning_enabled: true
+    pinning_thresh: 0.50
+    grinding_enabled: true
+    grinding_thresh: 0.60
+    stop_loss_thresh: 0.05
+    max_cancel_per_min: 40
+    inventory_skew_coeff: 0.002
+    vol_smoothing_alpha: 0.02
+    
+    # VPIN配置
+    vpin_enabled: true
+    vpin_bucket_size: 20000
+    vpin_num_buckets: 50
+    vpin_threshold: 0.7
+    vpin_pause_thresh: 0.9
+    vpin_multiplier: 0.2
+    vpin_vol_threshold: 40000
+    
+    # 兼容旧参数
+    base_layer_size: 0.01
+    near_layers: 8
+    far_layers: 16
+    far_layer_size: 0.01
+    near_layer_start_offset: 0.0004
+    near_layer_spacing_ratio: 1.35
+    far_layer_start_offset: 0.0015
+    far_layer_end_offset: 0.025
+    layer_spacing_mode: geometric
+    spacing_ratio: 1.1
+
+  # ==============================================
+  # 5. XRPUSDC (5%权重, 15U保证金)
+  # ==============================================
+  - symbol: "XRPUSDC"
+    net_max: 500                            # 500 XRP @ 0.6 = 300名义 = 15U保证金
+    min_spread: 0.0015                      # 0.15%价差（XRP波动大）
+    tick_size: 0.0001                       # $0.0001最小变动
+    min_qty: 1                              # 1 XRP最小量
+    
+    # 网格配置
+    total_layers: 7
+    unified_layer_size: 35                  # 35 XRP ≈ 75U (修复：降低以通过风控)
+    grid_start_offset: 0.002                # 第1层距mid 0.002 USDT
+    grid_first_spacing: 0.002               # 层间距起始 0.002 USDT
+    grid_spacing_multiplier: 1.15
+    grid_max_spacing: 0.05                  # 最大层间距 0.05 USDT
+    
+    # 风控配置
+    pinning_enabled: true
+    pinning_thresh: 0.50
+    grinding_enabled: true
+    grinding_thresh: 0.60
+    stop_loss_thresh: 0.05
+    max_cancel_per_min: 40
+    inventory_skew_coeff: 0.002
+    vol_smoothing_alpha: 0.02
+    
+    # VPIN配置
+    vpin_enabled: true
+    vpin_bucket_size: 100000                # XRP交易量大
+    vpin_num_buckets: 50
+    vpin_threshold: 0.7
+    vpin_pause_thresh: 0.9
+    vpin_multiplier: 0.2
+    vpin_vol_threshold: 200000
+    
+    # 兼容旧参数
+    base_layer_size: 1
+    near_layers: 8
+    far_layers: 16
+    far_layer_size: 1
+    near_layer_start_offset: 0.0004
+    near_layer_spacing_ratio: 1.35
+    far_layer_start_offset: 0.0015
+    far_layer_end_offset: 0.025
+    layer_spacing_mode: geometric
+    spacing_ratio: 1.1

@@ -150,8 +150,8 @@ func validateConfig(cfg *Config) error {
 		if sym.Symbol == "" {
 			return fmt.Errorf("symbols[%d]: symbol 不能为空", i)
 		}
-		if sym.NetMax <= 0.1 {
-			return fmt.Errorf("symbols[%d]: net_max 必须 > 0.1", i)
+		if sym.NetMax <= 0.001 {
+			return fmt.Errorf("symbols[%d]: net_max 必须 > 0.001（支持不同币种价格）", i)
 		}
 		if sym.MinSpread <= 0 || sym.MinSpread > 0.01 {
 			return fmt.Errorf("symbols[%d]: min_spread 必须在 (0, 0.01] 之间", i)
