@@ -227,6 +227,31 @@ var (
 		},
 		[]string{"symbol"},
 	)
+
+	// WebSocket流量监控（专家建议：防止数据雪球）
+	WSBytesReceived = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "phoenix_ws_bytes_received_total",
+			Help: "WebSocket接收字节数（下行流量）",
+		},
+		[]string{"symbol"},
+	)
+
+	WSMessageCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "phoenix_ws_message_count_total",
+			Help: "WebSocket消息数量（按类型统计）",
+		},
+		[]string{"symbol", "type"}, // type: depth, trade, order, account
+	)
+
+	WSBandwidthRate = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "phoenix_ws_bandwidth_bytes_per_min",
+			Help: "WebSocket带宽速率（字节/分钟）",
+		},
+		[]string{"symbol"},
+	)
 )
 
 func init() {
@@ -258,6 +283,9 @@ func init() {
 		VPINBucketCount,
 		VPINPauseCount,
 		VPINSpreadMultiplier,
+		WSBytesReceived,
+		WSMessageCount,
+		WSBandwidthRate,
 	)
 }
 
@@ -318,4 +346,15 @@ func UpdateVPINMetrics(symbol string, vpin float64, bucketCount int, spreadMulti
 // IncrementVPINPauseCount 增加VPIN暂停计数
 func IncrementVPINPauseCount(symbol string) {
 	VPINPauseCount.WithLabelValues(symbol).Inc()
+}
+
+// RecordWSMessage 记录WebSocket消息
+func RecordWSMessage(symbol, msgType string, bytes int) {
+	WSBytesReceived.WithLabelValues(symbol).Add(float64(bytes))
+	WSMessageCount.WithLabelValues(symbol, msgType).Inc()
+}
+
+// UpdateWSBandwidthRate 更新WebSocket带宽速率（每分钟调用）
+func UpdateWSBandwidthRate(symbol string, bytesPerMin float64) {
+	WSBandwidthRate.WithLabelValues(symbol).Set(bytesPerMin)
 }

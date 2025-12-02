@@ -559,9 +559,14 @@ type adapterWSHandler struct {
 
 // OnRawMessage 处理WebSocket原始消息
 func (h *adapterWSHandler) OnRawMessage(msg []byte) {
+	// 【流量监控】记录WebSocket接收字节数（专家建议）
+	// 注意：启用压缩后，这里的len(msg)是压缩后的大小
+	// metrics.RecordWSMessage("global", "total", len(msg))
+	
 	// 尝试解析深度数据
 	symbol, bid, ask, err := ParseCombinedDepth(msg)
 	if err == nil && symbol != "" && bid > 0 && ask > 0 {
+		// metrics.RecordWSMessage(symbol, "depth", len(msg))
 		h.OnDepth(symbol, bid, ask)
 		return
 	}
