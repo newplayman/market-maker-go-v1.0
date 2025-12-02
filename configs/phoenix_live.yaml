@@ -104,3 +104,14 @@ symbols:
     
     # 库存偏移系数（ASMM策略参数）
     inventory_skew_coeff: 0.002             # 库存偏移系数（默认0.002）
+    
+    # ====================VPIN配置（订单流毒性检测）====================
+    # VPIN (Volume-Synchronized Probability of Informed Trading)
+    # 用于检测订单流毒性，防止被知情交易者猎杀
+    vpin_enabled: false                     # 是否启用VPIN（默认禁用）
+    vpin_bucket_size: 50000                 # Bucket大小（成交量，默认50000）
+    vpin_num_buckets: 50                    # Bucket数量（默认50）
+    vpin_threshold: 0.7                     # 警报阈值（>0.7扩大价差20%）
+    vpin_pause_thresh: 0.9                  # 暂停阈值（>0.9暂停报价5秒）
+    vpin_multiplier: 0.2                    # Spread放大系数（默认0.2=20%）
+    vpin_vol_threshold: 100000              # 最小总成交量要求（默认100000）

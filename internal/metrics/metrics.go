@@ -194,6 +194,39 @@ var (
 		},
 		[]string{"symbol"},
 	)
+
+	// VPIN指标
+	VPINCurrent = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "phoenix_vpin_current",
+			Help: "当前VPIN值（0-1，越高表示订单流毒性越大）",
+		},
+		[]string{"symbol"},
+	)
+
+	VPINBucketCount = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "phoenix_vpin_bucket_count",
+			Help: "已填充的VPIN buckets数量",
+		},
+		[]string{"symbol"},
+	)
+
+	VPINPauseCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "phoenix_vpin_pause_total",
+			Help: "因VPIN过高而暂停报价的次数",
+		},
+		[]string{"symbol"},
+	)
+
+	VPINSpreadMultiplier = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "phoenix_vpin_spread_multiplier",
+			Help: "VPIN引起的价差放大倍数",
+		},
+		[]string{"symbol"},
+	)
 )
 
 func init() {
@@ -221,6 +254,10 @@ func init() {
 		StrategyMode,
 		InventorySkew,
 		VolatilityScaling,
+		VPINCurrent,
+		VPINBucketCount,
+		VPINPauseCount,
+		VPINSpreadMultiplier,
 	)
 }
 
@@ -269,4 +306,16 @@ func UpdateMarketMetrics(symbol string, mid, spread, funding float64) {
 	MidPrice.WithLabelValues(symbol).Set(mid)
 	PriceSpread.WithLabelValues(symbol).Set(spread)
 	FundingRate.WithLabelValues(symbol).Set(funding)
+}
+
+// UpdateVPINMetrics 更新VPIN指标
+func UpdateVPINMetrics(symbol string, vpin float64, bucketCount int, spreadMultiplier float64) {
+	VPINCurrent.WithLabelValues(symbol).Set(vpin)
+	VPINBucketCount.WithLabelValues(symbol).Set(float64(bucketCount))
+	VPINSpreadMultiplier.WithLabelValues(symbol).Set(spreadMultiplier)
+}
+
+// IncrementVPINPauseCount 增加VPIN暂停计数
+func IncrementVPINPauseCount(symbol string) {
+	VPINPauseCount.WithLabelValues(symbol).Inc()
 }

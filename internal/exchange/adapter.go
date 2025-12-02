@@ -12,12 +12,14 @@ import (
 
 // BinanceAdapter implements Exchange interface
 type BinanceAdapter struct {
-	rest       BinanceREST
-	restClient *BinanceRESTClient // 直接访问REST客户端以调用OpenOrders等方法
-	ws         BinanceWS
-	tradeWS    *TradeWSClient // WebSocket trading client
-	connected  bool
-	mu         sync.RWMutex
+	rest            BinanceREST
+	restClient      *BinanceRESTClient // 直接访问REST客户端以调用OpenOrders等方法
+	ws              BinanceWS
+	tradeWS         *TradeWSClient // WebSocket trading client
+	listenKeyClient *ListenKeyClient
+	connected       bool
+	wsStarted       bool // WebSocket是否已启动
+	mu              sync.RWMutex
 
 	// Callbacks
 	depthCallback func(*Depth)
@@ -28,6 +30,14 @@ type BinanceAdapter struct {
 	orders     map[string]*Order // key: clientOrderID -> Order
 	orderIDMap map[string]int64  // key: clientOrderID -> exchange orderId (数字)
 	stateMu    sync.RWMutex
+	
+	// Store reference for VPIN updates
+	store interface{} // *store.Store，使用interface{}避免循环依赖
+
+	// ListenKey management
+	currentListenKey string
+	listenKeyCtx     context.Context
+	listenKeyCancel  context.CancelFunc
 }
 
 // NewBinanceAdapter creates a new Binance exchange adapter
@@ -36,9 +46,18 @@ func NewBinanceAdapter(rest BinanceREST, ws BinanceWS) *BinanceAdapter {
 	// Get API keys from REST client if it's BinanceRESTClient
 	apiKey := ""
 	secretKey := ""
+	var listenKeyClient *ListenKeyClient
+	
 	if restClient, ok := rest.(*BinanceRESTClient); ok {
 		apiKey = restClient.APIKey
 		secretKey = restClient.Secret
+		
+		// Initialize ListenKey client
+		listenKeyClient = &ListenKeyClient{
+			BaseURL:    restClient.BaseURL,
+			APIKey:     apiKey,
+			HTTPClient: NewListenKeyHTTPClient(),
+		}
 	}
 
 	tradeWS := NewTradeWSClient(TradeWSConfig{
@@ -52,12 +71,13 @@ func NewBinanceAdapter(rest BinanceREST, ws BinanceWS) *BinanceAdapter {
 	})
 
 	adapter := &BinanceAdapter{
-		rest:       rest,
-		ws:         ws,
-		tradeWS:    tradeWS,
-		positions:  make(map[string]*Position),
-		orders:     make(map[string]*Order),
-		orderIDMap: make(map[string]int64),
+		rest:            rest,
+		ws:              ws,
+		tradeWS:         tradeWS,
+		listenKeyClient: listenKeyClient,
+		positions:       make(map[string]*Position),
+		orders:          make(map[string]*Order),
+		orderIDMap:      make(map[string]int64),
 	}
 
 	// 保存REST客户端引用以便调用OpenOrders等方法
@@ -313,6 +333,10 @@ func (b *BinanceAdapter) StartDepthStream(ctx context.Context, symbols []string,
 	}
 
 	log.Info().Strs("symbols", symbols).Msg("深度流已订阅")
+	
+	// Start WebSocket if not already started
+	b.startWebSocketIfReady()
+	
 	return nil
 }
 
@@ -322,14 +346,68 @@ func (b *BinanceAdapter) StartUserStream(ctx context.Context, callbacks *UserStr
 	b.userCallbacks = callbacks
 	b.mu.Unlock()
 
+	// Get real listenKey from Binance
+	var listenKey string
+	if b.listenKeyClient != nil {
+		var err error
+		listenKey, err = b.listenKeyClient.NewListenKey()
+		if err != nil {
+			return fmt.Errorf("failed to get listenKey: %w", err)
+		}
+		log.Info().Msg("成功获取 listenKey")
+		
+		// Save listenKey
+		b.mu.Lock()
+		b.currentListenKey = listenKey
+		b.mu.Unlock()
+		
+		// Start listenKey refresh goroutine
+		b.startListenKeyRefresh(ctx, listenKey)
+	} else {
+		log.Warn().Msg("ListenKey 客户端未初始化，使用 dummy key")
+		listenKey = "dummy-listen-key"
+	}
+
 	// Subscribe to user data stream
-	listenKey := "dummy-listen-key" // Should be obtained from REST API
 	if err := b.ws.SubscribeUserData(listenKey); err != nil {
 		return err
 	}
 
 	log.Info().Msg("用户数据流已订阅")
+	
+	// Start WebSocket if not already started
+	b.startWebSocketIfReady()
+	
 	return nil
+}
+
+// startListenKeyRefresh starts a goroutine to refresh listenKey every 30 minutes
+func (b *BinanceAdapter) startListenKeyRefresh(ctx context.Context, listenKey string) {
+	// Cancel any existing refresh goroutine
+	b.mu.Lock()
+	if b.listenKeyCancel != nil {
+		b.listenKeyCancel()
+	}
+	b.listenKeyCtx, b.listenKeyCancel = context.WithCancel(ctx)
+	b.mu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-b.listenKeyCtx.Done():
+				return
+			case <-ticker.C:
+				if err := b.listenKeyClient.KeepAlive(listenKey); err != nil {
+					log.Error().Err(err).Msg("刷新 listenKey 失败")
+				} else {
+					log.Debug().Msg("listenKey 刷新成功")
+				}
+			}
+		}
+	}()
 }
 
 // Connect establishes connection to the exchange
@@ -345,24 +423,61 @@ func (b *BinanceAdapter) Connect(ctx context.Context) error {
 	b.tradeWS.Start(ctx)
 	log.Info().Msg("WebSocket交易客户端已启动")
 
+	b.connected = true
+	log.Info().Msg("Exchange已连接")
+
+	// Note: WebSocket for market data will be started after subscriptions are set up
+	return nil
+}
+
+// startWebSocketIfReady starts the WebSocket connection after subscriptions are ready
+func (b *BinanceAdapter) startWebSocketIfReady() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Only start WebSocket once
+	if b.wsStarted {
+		return
+	}
+
+	b.wsStarted = true
+
 	// Start WebSocket handler for market data
 	go func() {
 		handler := &adapterWSHandler{adapter: b}
 		if err := b.ws.Run(handler); err != nil {
 			log.Error().Err(err).Msg("WebSocket运行错误")
+			
+			// Mark as not started so it can be retried
+			b.mu.Lock()
+			b.wsStarted = false
+			b.mu.Unlock()
 		}
 	}()
 
-	b.connected = true
-	log.Info().Msg("Exchange已连接")
-
-	return nil
+	log.Info().Msg("WebSocket市场数据流已启动")
 }
 
 // Disconnect closes the connection
 func (b *BinanceAdapter) Disconnect() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// Cancel listenKey refresh
+	if b.listenKeyCancel != nil {
+		b.listenKeyCancel()
+		b.listenKeyCancel = nil
+	}
+
+	// Close listenKey
+	if b.listenKeyClient != nil && b.currentListenKey != "" {
+		if err := b.listenKeyClient.CloseListenKey(b.currentListenKey); err != nil {
+			log.Warn().Err(err).Msg("关闭 listenKey 失败")
+		} else {
+			log.Info().Msg("listenKey 已关闭")
+		}
+		b.currentListenKey = ""
+	}
 
 	// Close WebSocket trading client
 	if b.tradeWS != nil {
@@ -371,8 +486,61 @@ func (b *BinanceAdapter) Disconnect() error {
 	}
 
 	b.connected = false
+	b.wsStarted = false
 	log.Info().Msg("Exchange已断开")
 
+	return nil
+}
+
+// ReconnectStreams reconnects WebSocket streams
+func (b *BinanceAdapter) ReconnectStreams(ctx context.Context) error {
+	log.Warn().Msg("正在重连 WebSocket 流...")
+
+	b.mu.Lock()
+	wsStarted := b.wsStarted
+	b.wsStarted = false
+	b.mu.Unlock()
+
+	// Only attempt reconnect if WebSocket was started
+	if !wsStarted {
+		log.Debug().Msg("WebSocket 未启动，跳过重连")
+		return nil
+	}
+
+	// Get new listenKey if available
+	if b.listenKeyClient != nil {
+		listenKey, err := b.listenKeyClient.NewListenKey()
+		if err != nil {
+			log.Error().Err(err).Msg("重连时获取 listenKey 失败")
+			return fmt.Errorf("failed to get new listenKey: %w", err)
+		}
+
+		b.mu.Lock()
+		oldListenKey := b.currentListenKey
+		b.currentListenKey = listenKey
+		b.mu.Unlock()
+
+		// Close old listenKey
+		if oldListenKey != "" {
+			if err := b.listenKeyClient.CloseListenKey(oldListenKey); err != nil {
+				log.Warn().Err(err).Msg("关闭旧 listenKey 失败")
+			}
+		}
+
+		// Re-subscribe with new listenKey
+		if err := b.ws.SubscribeUserData(listenKey); err != nil {
+			return fmt.Errorf("failed to re-subscribe user data: %w", err)
+		}
+
+		// Restart listenKey refresh
+		b.startListenKeyRefresh(ctx, listenKey)
+		log.Info().Msg("listenKey 已更新")
+	}
+
+	// Restart WebSocket
+	b.startWebSocketIfReady()
+
+	log.Info().Msg("WebSocket 流重连完成")
 	return nil
 }
 
@@ -465,7 +633,35 @@ func (h *adapterWSHandler) OnDepth(symbol string, bid, ask float64) {
 
 // OnTrade handles trade updates from WebSocket
 func (h *adapterWSHandler) OnTrade(symbol string, price, qty float64) {
-	// Trade events can be used for additional processing if needed
+	// 转发交易数据到Store进行VPIN计算
+	h.adapter.mu.RLock()
+	store := h.adapter.store
+	h.adapter.mu.RUnlock()
+
+	if store != nil {
+		// 创建Trade对象
+		trade := struct {
+			Symbol    string
+			Price     float64
+			Quantity  float64
+			Timestamp time.Time
+			IsBuy     bool
+		}{
+			Symbol:    symbol,
+			Price:     price,
+			Quantity:  qty,
+			Timestamp: time.Now(),
+			IsBuy:     false, // 将由VPIN计算器根据mid price推断
+		}
+
+		// 使用类型断言更新Store
+		if s, ok := store.(interface {
+			UpdateTrade(symbol string, trade interface{})
+		}); ok {
+			s.UpdateTrade(symbol, trade)
+		}
+	}
+
 	log.Debug().
 		Str("symbol", symbol).
 		Float64("price", price).
@@ -528,4 +724,12 @@ func (b *BinanceAdapter) GetAccountBalance(ctx context.Context) (float64, float6
 	}
 
 	return accountInfo.TotalWalletBalance, accountInfo.TotalUnrealizedProfit, nil
+}
+
+// SetStore 设置Store引用（用于VPIN更新）
+// store应为*store.Store类型
+func (b *BinanceAdapter) SetStore(store interface{}) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.store = store
 }

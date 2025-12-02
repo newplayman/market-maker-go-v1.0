@@ -22,6 +22,15 @@ type Position struct {
 	LastUpdateTime time.Time `json:"last_update_time"`
 }
 
+// Trade 交易信息（用于VPIN计算）
+type Trade struct {
+	Symbol    string
+	Price     float64
+	Quantity  float64
+	Timestamp time.Time
+	IsBuy     bool // true=买方发起，false=卖方发起
+}
+
 // SymbolState 单个交易对的状态
 type SymbolState struct {
 	Mu sync.RWMutex
@@ -58,6 +67,10 @@ type SymbolState struct {
 
 	// 策略状态
 	LastMode string // 最后使用的策略模式 (normal/pinning/grinding)
+
+	// VPIN支持（可选，默认nil）
+	VPINEnabled bool        // VPIN是否启用
+	VPIN        interface{} // *VPINCalculator，使用interface{}避免循环依赖
 }
 
 type Store struct {
@@ -479,4 +492,115 @@ func (s *Store) GetAllSymbols() []string {
 		symbols = append(symbols, symbol)
 	}
 	return symbols
+}
+
+// EnableVPIN 为指定symbol启用VPIN计算
+// vpinCalc应为*strategy.VPINCalculator类型
+func (s *Store) EnableVPIN(symbol string, vpinCalc interface{}) {
+	s.mu.RLock()
+	state := s.symbols[symbol]
+	s.mu.RUnlock()
+
+	if state == nil {
+		log.Warn().Str("symbol", symbol).Msg("交易对未初始化，无法启用VPIN")
+		return
+	}
+
+	state.Mu.Lock()
+	state.VPINEnabled = true
+	state.VPIN = vpinCalc
+	state.Mu.Unlock()
+
+	log.Info().Str("symbol", symbol).Msg("VPIN已启用")
+}
+
+// DisableVPIN 为指定symbol禁用VPIN计算
+func (s *Store) DisableVPIN(symbol string) {
+	s.mu.RLock()
+	state := s.symbols[symbol]
+	s.mu.RUnlock()
+
+	if state == nil {
+		return
+	}
+
+	state.Mu.Lock()
+	state.VPINEnabled = false
+	state.VPIN = nil
+	state.Mu.Unlock()
+
+	log.Info().Str("symbol", symbol).Msg("VPIN已禁用")
+}
+
+// UpdateTrade 更新交易数据（用于VPIN计算）
+// 此方法会被exchange层调用，需要保证线程安全
+func (s *Store) UpdateTrade(symbol string, trade Trade) {
+	s.mu.RLock()
+	state := s.symbols[symbol]
+	s.mu.RUnlock()
+
+	if state == nil {
+		return
+	}
+
+	state.Mu.Lock()
+	vpinEnabled := state.VPINEnabled
+	vpinCalc := state.VPIN
+	state.Mu.Unlock()
+
+	// 如果VPIN已启用，更新VPIN计算器
+	if vpinEnabled && vpinCalc != nil {
+		// 使用类型断言，但需要避免循环依赖
+		// 在实际使用中，会由strategy层提供接口
+		if calc, ok := vpinCalc.(interface {
+			UpdateTrade(trade interface{}) error
+			UpdateMidPrice(mid float64)
+		}); ok {
+			// 先更新mid price
+			state.Mu.RLock()
+			mid := state.MidPrice
+			state.Mu.RUnlock()
+			
+			if mid > 0 {
+				calc.UpdateMidPrice(mid)
+			}
+
+			// 然后更新trade
+			if err := calc.UpdateTrade(trade); err != nil {
+				log.Debug().
+					Err(err).
+					Str("symbol", symbol).
+					Msg("VPIN更新交易失败")
+			}
+		}
+	}
+}
+
+// GetVPIN 获取指定symbol的VPIN值
+func (s *Store) GetVPIN(symbol string) float64 {
+	s.mu.RLock()
+	state := s.symbols[symbol]
+	s.mu.RUnlock()
+
+	if state == nil {
+		return 0.5 // 中性值
+	}
+
+	state.Mu.RLock()
+	vpinEnabled := state.VPINEnabled
+	vpinCalc := state.VPIN
+	state.Mu.RUnlock()
+
+	if !vpinEnabled || vpinCalc == nil {
+		return 0.5 // 未启用时返回中性值
+	}
+
+	// 使用类型断言获取VPIN值
+	if calc, ok := vpinCalc.(interface {
+		GetVPIN() float64
+	}); ok {
+		return calc.GetVPIN()
+	}
+
+	return 0.5 // fallback
 }
