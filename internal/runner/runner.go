@@ -32,6 +32,10 @@ type Runner struct {
 	stopChan chan struct{}
 	stopped  bool
 	mu       sync.Mutex
+
+	// WebSocket reconnection tracking
+	lastReconnectTime time.Time
+	reconnectMu       sync.Mutex
 }
 
 // NewRunner 创建Runner实例
@@ -837,8 +841,8 @@ func (r *Runner) monitorGlobalState() {
 				// 记录错误
 				metrics.RecordError("websocket_stale", symbol)
 
-				// TODO: 可以在这里触发WebSocket重连
-				// r.exchange.ReconnectDepthStream(ctx, symbol)
+				// 触发WebSocket重连（带防抖）
+				r.tryReconnectWebSocket()
 			}
 		}
 
@@ -930,4 +934,29 @@ func (r *Runner) logDashboardStats() {
 		jsonBytes, _ := json.Marshal(stats)
 		log.Info().RawJSON("ticker_data", jsonBytes).Msg("TICKER_EVENT")
 	}
+}
+
+// tryReconnectWebSocket 尝试重连WebSocket，带防抖机制
+func (r *Runner) tryReconnectWebSocket() {
+	r.reconnectMu.Lock()
+	defer r.reconnectMu.Unlock()
+
+	// 防抖：距离上次重连至少30秒
+	if time.Since(r.lastReconnectTime) < 30*time.Second {
+		log.Debug().Msg("重连请求被防抖限制，距离上次重连时间过短")
+		return
+	}
+
+	r.lastReconnectTime = time.Now()
+
+	// 在新 goroutine 中执行重连，避免阻塞
+	go func() {
+		log.Warn().Msg("尝试重连 WebSocket 流...")
+		ctx := context.Background()
+		if err := r.exchange.ReconnectStreams(ctx); err != nil {
+			log.Error().Err(err).Msg("WebSocket 重连失败")
+		} else {
+			log.Info().Msg("WebSocket 重连成功")
+		}
+	}()
 }

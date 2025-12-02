@@ -86,6 +86,27 @@ func main() {
 	strat := strategy.NewASMM(cfg, st)
 	log.Info().Msg("策略创建完成")
 
+	// 根据配置启用VPIN
+	for _, symCfg := range cfg.Symbols {
+		if symCfg.VPINEnabled {
+			vpinCfg := strategy.VPINConfig{
+				BucketSize:   symCfg.VPINBucketSize,
+				NumBuckets:   symCfg.VPINNumBuckets,
+				Threshold:    symCfg.VPINThreshold,
+				PauseThresh:  symCfg.VPINPauseThresh,
+				Multiplier:   symCfg.VPINMultiplier,
+				VolThreshold: symCfg.VPINVolThreshold,
+			}
+			strat.EnableVPIN(symCfg.Symbol, vpinCfg)
+			log.Info().
+				Str("symbol", symCfg.Symbol).
+				Float64("bucket_size", vpinCfg.BucketSize).
+				Int("num_buckets", vpinCfg.NumBuckets).
+				Float64("threshold", vpinCfg.Threshold).
+				Msg("VPIN已为交易对启用")
+		}
+	}
+
 	// 创建风控管理器
 	log.Info().Msg("创建风控管理器...")
 	riskMgr := risk.NewRiskManager(cfg, st)

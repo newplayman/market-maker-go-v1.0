@@ -86,6 +86,7 @@ type Exchange interface {
 	// WebSocket streams
 	StartDepthStream(ctx context.Context, symbols []string, callback func(*Depth)) error
 	StartUserStream(ctx context.Context, callbacks *UserStreamCallbacks) error
+	ReconnectStreams(ctx context.Context) error
 
 	// Connection management
 	Connect(ctx context.Context) error

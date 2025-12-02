@@ -108,7 +108,7 @@ symbols:
     # ====================VPIN配置（订单流毒性检测）====================
     # VPIN (Volume-Synchronized Probability of Informed Trading)
     # 用于检测订单流毒性，防止被知情交易者猎杀
-    vpin_enabled: false                     # 是否启用VPIN（默认禁用）
+    vpin_enabled: true                      # 是否启用VPIN（已启用）
     vpin_bucket_size: 50000                 # Bucket大小（成交量，默认50000）
     vpin_num_buckets: 50                    # Bucket数量（默认50）
     vpin_threshold: 0.7                     # 警报阈值（>0.7扩大价差20%）
