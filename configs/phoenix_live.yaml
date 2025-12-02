@@ -2,13 +2,13 @@
 # 测试资金: 1000 USDC, 20X杠杆
 # 交易对: ETHUSDC, BTCUSDC, SOLUSDC, BNBUSDC, XRPUSDC
 #
-# 【多交易对资金分配 - 2025-12-02】
-# 总保证金需求: 187.5 USDC (18.75%资金使用率)
+# 【多交易对资金分配 - 2025-12-02 v2】
+# 总保证金需求: 181 USDC (18.1%资金使用率)
 # - ETHUSDC: 75 USDC (35%权重)
-# - BTCUSDC: 31.5 USDC (30%权重)
+# - DOGEUSDC: 25 USDC (25%权重) ← 替换BTCUSDC
 # - SOLUSDC: 36 USDC (20%权重)
 # - BNBUSDC: 30 USDC (10%权重)
-# - XRPUSDC: 15 USDC (5%权重)
+# - XRPUSDC: 15 USDC (10%权重)
 #
 # 【关键限制调整】
 # 1. max_cancel_per_min: 200 → 40 (每个交易对)
@@ -94,21 +94,21 @@ symbols:
     spacing_ratio: 1.1
 
   # ==============================================
-  # 2. BTCUSDC (30%权重, 31.5U保证金)
+  # 2. DOGEUSDC (25%权重, 25U保证金) ← 替换BTCUSDC
   # ==============================================
-  - symbol: "BTCUSDC"
-    net_max: 0.015                          # 0.015 BTC @ 42000 = 630名义 = 31.5U保证金
-    min_spread: 0.001                       # 0.1%价差（修复：增加以通过验证）
-    tick_size: 0.1                          # $0.1最小变动
-    min_qty: 0.001                          # 0.001 BTC最小量
+  - symbol: "DOGEUSDC"
+    net_max: 2500                           # 2500 DOGE @ 0.145 = 363名义 = 18U保证金
+    min_spread: 0.002                       # 0.2%价差（DOGE波动较大）
+    tick_size: 0.00001                      # $0.00001最小变动
+    min_qty: 1                              # 1 DOGE最小量
     
     # 网格配置
     total_layers: 7
-    unified_layer_size: 0.001               # 0.001 BTC ≈ 90U (修复：降低以通过风控)
-    grid_start_offset: 40.0                 # 第1层距mid 40 USDT（增加以满足min_spread）
-    grid_first_spacing: 40.0                # 层间距起始 40 USDT
+    unified_layer_size: 175                 # 175 DOGE ≈ 25U（修复：降低以通过批量风控）
+    grid_start_offset: 0.0002               # 第1层距mid 0.0002 USDT
+    grid_first_spacing: 0.0002              # 层间距起始 0.0002 USDT
     grid_spacing_multiplier: 1.15
-    grid_max_spacing: 200.0                 # BTC波动大，最大间距200
+    grid_max_spacing: 0.005                 # 最大层间距 0.005 USDT
     
     # 风控配置
     pinning_enabled: true
@@ -120,20 +120,20 @@ symbols:
     inventory_skew_coeff: 0.002
     vol_smoothing_alpha: 0.02
     
-    # VPIN配置（BTC流动性好，bucket更大）
+    # VPIN配置（DOGE交易量大）
     vpin_enabled: true
-    vpin_bucket_size: 100000
+    vpin_bucket_size: 200000                # DOGE交易活跃，bucket较大
     vpin_num_buckets: 50
     vpin_threshold: 0.7
     vpin_pause_thresh: 0.9
     vpin_multiplier: 0.2
-    vpin_vol_threshold: 200000
+    vpin_vol_threshold: 400000
     
     # 兼容旧参数
-    base_layer_size: 0.001
+    base_layer_size: 10
     near_layers: 8
     far_layers: 16
-    far_layer_size: 0.001
+    far_layer_size: 10
     near_layer_start_offset: 0.0004
     near_layer_spacing_ratio: 1.35
     far_layer_start_offset: 0.0015
