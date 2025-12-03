@@ -144,6 +144,15 @@ var (
 		[]string{"symbol"},
 	)
 
+	DepthProcessing = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "phoenix_depth_processing_duration_seconds",
+			Help:    "深度数据处理耗时",
+			Buckets: []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1}, // 更细粒度的buckets
+		},
+		[]string{"symbol"},
+	)
+
 	OrderPlacement = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "phoenix_order_placement_duration_seconds",
@@ -273,6 +282,7 @@ func init() {
 		MaxDrawdown,
 		CancelRate,
 		QuoteGeneration,
+		DepthProcessing,
 		OrderPlacement,
 		APILatency,
 		ErrorCount,

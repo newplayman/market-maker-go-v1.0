@@ -25,3 +25,12 @@ func (b *BinanceWSStub) Run(handler WSHandler) error {
 	}
 	return nil
 }
+
+// OnDisconnect 【修复断流】实现接口方法（stub不需要实际处理）
+func (b *BinanceWSStub) OnDisconnect(cb func(error)) {
+	// Stub实现，不需要实际处理
+}
+
+func (b *BinanceWSStub) CloseConnection() {
+	// Stub实现，不需要实际处理
+}

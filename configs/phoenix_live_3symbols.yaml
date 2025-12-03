@@ -1,0 +1,136 @@
+# Phoenix v2 实盘配置 - 3交易对策略（流量优化版）
+# 测试资金: 1000 USDC, 20X杠杆
+# 交易对: ETHUSDC, DOGEUSDC, SOLUSDC (砍掉BNBUSDC和XRPUSDC)
+#
+# 【3交易对资金分配 - 流量优化版】
+# 总保证金需求: 136 USDC (13.6%资金使用率)
+# - ETHUSDC: 75 USDC (35%权重)
+# - DOGEUSDC: 25 USDC (25%权重)
+# - SOLUSDC: 36 USDC (20%权重)
+#
+# 【流量优化】
+# 1. 减少2个交易对，WebSocket流量预计降低40%
+# 2. 保留高流动性交易对（ETH/DOGE/SOL）
+# 3. 如果流量仍>400k，考虑进一步优化
+#
+# 【关键限制调整】
+# 1. max_cancel_per_min: 40 (每个交易对)
+# 2. total_notional_max: 3000 (3个交易对总名义价值约2500 USDC)
+
+global:
+  # ==================== 网络配置 ====================
+  testnet: false                            # 实盘模式
+  
+  # ==================== 风控配置 ====================
+  total_notional_max: 3000.0                 # 总名义价值上限 3000 (3个交易对)
+  
+  # ==================== 报价配置 ====================
+  quote_interval_ms: 1000                   # 报价间隔 1000ms (1秒)
+  
+  # ==================== 监控配置 ====================
+  metrics_port: 9090                        # Prometheus监控端口
+  
+  # ==================== 持久化配置 ====================
+  snapshot_path: "./data/snapshot_mainnet.json"  # 实盘快照路径
+  snapshot_interval: 60                           # 快照间隔60秒
+  
+  # ==================== 日志配置 ====================
+  log_level: "info"                         # 日志级别
+
+# ==================== 交易对配置 ====================
+# 3个永续合约同时运行，每个14层挂单
+symbols:
+  # ==============================================
+  # 1. ETHUSDC (35%权重, 75U保证金)
+  # ==============================================
+  - symbol: "ETHUSDC"
+    net_max: 0.50                           # 0.50 ETH @ 3000 = 1500名义 = 75U保证金
+    min_spread: 0.0003                       # 最小价差 0.03%
+    tick_size: 0.01                          # 价格最小变动 $0.01
+    min_qty: 0.001                           # 最小下单量 0.001 ETH
+    total_layers: 7                          # 每边7层，共14层
+    unified_layer_size: 0.07                 # 每层0.07 ETH ≈ 210U
+    grid_start_offset: 0.0005                # 起始偏移 0.05%
+    grid_first_spacing: 0.0005               # 第一层间距 0.05%
+    grid_spacing_multiplier: 1.15            # 间距倍数
+    grid_max_spacing: 0.01                    # 最大间距 1%
+    pinning_enabled: true
+    pinning_thresh: 0.50
+    grinding_enabled: true
+    grinding_thresh: 0.60
+    stop_loss_thresh: 0.05
+    vol_smoothing_alpha: 0.02
+    max_cancel_per_min: 40                   # 调整为40，适配全局120/min限制
+    inventory_skew_coeff: 0.002
+    vpin:
+      enabled: true
+      bucket_size: 50000
+      num_buckets: 50
+      threshold: 0.7
+      pause_threshold: 0.9
+      multiplier: 0.2
+      vol_threshold: 100000
+
+  # ==============================================
+  # 2. DOGEUSDC (25%权重, 25U保证金)
+  # ==============================================
+  - symbol: "DOGEUSDC"
+    net_max: 2500                            # 2500 DOGE @ 0.145 = 363名义 = 18U保证金
+    min_spread: 0.0005                       # 最小价差 0.05%
+    tick_size: 0.00001                       # 价格最小变动 $0.00001
+    min_qty: 1                               # 最小下单量 1 DOGE
+    total_layers: 7
+    unified_layer_size: 175                  # 175 DOGE ≈ 25U
+    grid_start_offset: 0.0002
+    grid_first_spacing: 0.0002
+    grid_spacing_multiplier: 1.15
+    grid_max_spacing: 0.005
+    pinning_enabled: true
+    pinning_thresh: 0.50
+    grinding_enabled: true
+    grinding_thresh: 0.60
+    stop_loss_thresh: 0.05
+    vol_smoothing_alpha: 0.02
+    max_cancel_per_min: 40
+    inventory_skew_coeff: 0.002
+    vpin:
+      enabled: true
+      bucket_size: 200000
+      num_buckets: 50
+      threshold: 0.7
+      pause_threshold: 0.9
+      multiplier: 0.2
+      vol_threshold: 400000
+
+  # ==============================================
+  # 3. SOLUSDC (20%权重, 36U保证金)
+  # ==============================================
+  - symbol: "SOLUSDC"
+    net_max: 6.0                             # 6 SOL @ 120 = 720名义 = 36U保证金
+    min_spread: 0.0005                       # 最小价差 0.05%
+    tick_size: 0.01                          # 价格最小变动 $0.01
+    min_qty: 0.01                            # 最小下单量 0.01 SOL
+    total_layers: 7
+    unified_layer_size: 0.4                  # 0.4 SOL ≈ 48U
+    grid_start_offset: 0.0005
+    grid_first_spacing: 0.0005
+    grid_spacing_multiplier: 1.15
+    grid_max_spacing: 0.01
+    pinning_enabled: true
+    pinning_thresh: 0.50
+    grinding_enabled: true
+    grinding_thresh: 0.60
+    stop_loss_thresh: 0.05
+    vol_smoothing_alpha: 0.02
+    max_cancel_per_min: 40
+    inventory_skew_coeff: 0.002
+    vpin:
+      enabled: true
+      bucket_size: 30000
+      num_buckets: 50
+      threshold: 0.7
+      pause_threshold: 0.9
+      multiplier: 0.2
+      vol_threshold: 60000
+
+

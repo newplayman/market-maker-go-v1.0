@@ -2,7 +2,6 @@ package strategy
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"sync"
 
@@ -77,13 +76,15 @@ func (a *ASMM) GenerateQuotes(ctx context.Context, symbol string) ([]Quote, []Qu
 	// 这是最后一道防线，防止持仓失控导致强平
 	posRatio := math.Abs(pos) / symCfg.NetMax
 	if posRatio > 0.80 {
-		log.Error().
+		log.Warn().
 			Str("symbol", symbol).
 			Float64("pos", pos).
 			Float64("net_max", symCfg.NetMax).
 			Float64("pos_ratio", posRatio*100).
-			Msg("【紧急熔断】持仓超过80% netMax，停止报价以防止持仓继续扩大")
-		return nil, nil, fmt.Errorf("紧急熔断: 持仓使用率%.1f%%超过80%%阈值，停止报价", posRatio*100)
+			Msg("【紧急熔断警告】持仓超过80% netMax，将仅允许减仓")
+		// 【修复】不要停止报价，否则无法减仓！
+		// 后续的adjustQuotesForRisk会负责过滤掉加仓单
+		// return nil, nil, fmt.Errorf("紧急熔断: 持仓使用率%.1f%%超过80%%阈值，停止报价", posRatio*100)
 	}
 
 	// 如果持仓超过50%，记录警告日志
@@ -619,7 +620,12 @@ func (a *ASMM) generatePinningQuotes(bestBid, bestAsk float64, pos float64, cfg 
 	sellQuotes := make([]Quote, 0)
 
 	// 钉子大小：基础大小 * 2.3
-	pinSize := cfg.BaseLayerSize * 2.3
+	baseSize := cfg.BaseLayerSize
+	if baseSize <= 0 {
+		baseSize = cfg.UnifiedLayerSize
+	}
+	pinSize := baseSize * 2.3
+	pinSize = a.roundQty(pinSize, cfg.MinQty)
 
 	if pos > 0 {
 		// 多头仓位：钉在卖价
@@ -688,6 +694,15 @@ func (a *ASMM) roundPrice(price, tickSize float64) float64 {
 		return price
 	}
 	return math.Round(price/tickSize) * tickSize
+}
+
+// roundQty 数量对齐到stepSize
+func (a *ASMM) roundQty(qty, stepSize float64) float64 {
+	if stepSize <= 0 {
+		return qty
+	}
+	// 使用Round确保最接近，避免精度误差
+	return math.Round(qty/stepSize) * stepSize
 }
 
 // logModeChange 记录模式切换

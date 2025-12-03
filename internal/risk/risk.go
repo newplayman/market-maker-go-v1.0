@@ -181,7 +181,7 @@ func (r *RiskManager) CheckBatchPreTrade(symbol string, buyQuotes, sellQuotes []
 	// - 持有多头时，限制买单（加仓方向），不限制卖单（平仓方向）
 	// - 持有空头时，限制卖单（加仓方向），不限制买单（平仓方向）
 	// - 无仓位时，双向都限制
-	maxWorstCase := symCfg.NetMax * 0.5
+	maxWorstCase := symCfg.NetMax * 1.5 // 【修复】从0.5改为1.5，与CheckPreTrade保持一致
 
 	// 根据当前仓位决定检查哪个方向
 	if currentPos >= 0 {

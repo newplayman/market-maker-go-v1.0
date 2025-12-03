@@ -92,6 +92,10 @@ type Exchange interface {
 	Connect(ctx context.Context) error
 	Disconnect() error
 	IsConnected() bool
+
+	// Account management
+	SetLeverage(ctx context.Context, symbol string, leverage int) error
+	SetMarginType(ctx context.Context, symbol string, marginType string) error
 }
 
 // UserStreamCallbacks defines callbacks for user stream events

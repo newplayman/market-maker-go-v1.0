@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/newplayman/market-maker-phoenix/internal/config"
@@ -33,9 +34,22 @@ type Runner struct {
 	stopped  bool
 	mu       sync.Mutex
 
-	// WebSocket reconnection tracking
-	lastReconnectTime time.Time
-	reconnectMu       sync.Mutex
+	// 【P0-3】WebSocket重连状态管理(统一)
+	reconnectMu           sync.Mutex
+	lastReconnectTime     time.Time
+	reconnectAttempts     int  // 重连尝试次数
+	reconnectInProgress   bool // 是否正在重连中
+	reconnectSuccessCount int  // 重连成功次数
+	reconnectFailCount    int  // 重连失败次数
+
+	// 【P1-1】WebSocket消息处理解耦
+	depthChan      chan *gateway.Depth // 深度消息缓冲channel
+	depthDropCount int64               // 丢弃的消息数(背压时)
+
+	// 看门狗/安全模式
+	safeModeMu     sync.RWMutex
+	safeMode       bool
+	safeModeReason string
 }
 
 // NewRunner 创建Runner实例
@@ -74,6 +88,24 @@ func (r *Runner) Start(ctx context.Context) error {
 	}
 	log.Info().Msg("交易所连接成功")
 
+	// 【新增】设置全仓/逐仓模式 (逐仓 ISOLATED)
+	for _, symCfg := range r.cfg.Symbols {
+		log.Info().Str("symbol", symCfg.Symbol).Str("type", "ISOLATED").Msg("设置逐仓模式")
+		if err := r.exchange.SetMarginType(ctx, symCfg.Symbol, "ISOLATED"); err != nil {
+			// 如果已经是逐仓模式，币安会返回错误，这里仅记录警告
+			log.Warn().Err(err).Str("symbol", symCfg.Symbol).Msg("设置逐仓模式失败 (可能是已设置)")
+		}
+	}
+
+	// 【新增】设置杠杆倍数 (默认20X)
+	for _, symCfg := range r.cfg.Symbols {
+		log.Info().Str("symbol", symCfg.Symbol).Int("leverage", 20).Msg("设置杠杆倍数")
+		if err := r.exchange.SetLeverage(ctx, symCfg.Symbol, 20); err != nil {
+			log.Warn().Err(err).Str("symbol", symCfg.Symbol).Msg("设置杠杆失败，将使用默认杠杆")
+			// 不阻断启动，继续执行
+		}
+	}
+
 	// 启动深度流
 	symbols := make([]string, 0, len(r.cfg.Symbols))
 	for _, symCfg := range r.cfg.Symbols {
@@ -102,6 +134,11 @@ func (r *Runner) Start(ctx context.Context) error {
 		r.wg.Add(1)
 		go r.runSymbol(ctx, symCfg.Symbol)
 	}
+
+	// 【P1-1】启动深度消息处理goroutine(解耦接收和处理)
+	r.depthChan = make(chan *gateway.Depth, DEPTH_CHANNEL_BUFFER_SIZE)
+	r.wg.Add(1)
+	go r.runDepthProcessor(ctx)
 
 	// 启动全局监控协程
 	r.wg.Add(1)
@@ -194,6 +231,14 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 		metrics.QuoteGeneration.WithLabelValues(symbol).Observe(duration)
 	}()
 
+	if ok, reason := r.inSafeMode(); ok {
+		log.Debug().
+			Str("symbol", symbol).
+			Str("reason", reason).
+			Msg("安全模式生效，跳过本轮做市")
+		return nil
+	}
+
 	// 【修复假死】无条件检查并重置撤单计数器（防止假死）
 	// 必须在函数开头执行，确保每次循环都会检查
 	symCfg := r.cfg.GetSymbolConfig(symbol)
@@ -224,7 +269,7 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 	}
 
 	// 订单溢出熔断阈值
-	const orderOverflowThreshold = 50
+	const orderOverflowThreshold = ORDER_OVERFLOW_THRESHOLD
 
 	// 读取当前活跃订单数量
 	activeOrdersCount := r.store.GetActiveOrderCount(symbol)
@@ -253,17 +298,21 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 		midPrice := state.MidPrice
 		state.Mu.RUnlock()
 
-		// 如果价格从未更新（刚启动且WSS未推）或超过3秒未更新
-		if lastUpdate.IsZero() || time.Since(lastUpdate) > 3*time.Second {
+		// 【修复断流】将检测阈值从3秒降低到2秒，更快检测断流
+		if lastUpdate.IsZero() || time.Since(lastUpdate) > STALE_PRICE_THRESHOLD_SECONDS*time.Second {
 			log.Error().
 				Str("symbol", symbol).
 				Time("last_update", lastUpdate).
 				Dur("stale_duration", time.Since(lastUpdate)).
 				Float64("mid", midPrice).
 				Msg("【告警】价格数据过期，停止报价！WebSocket可能断流")
-			
+
 			// 记录错误到metrics
 			metrics.RecordError("stale_price_data", symbol)
+
+			// 【修复断流】检测到断流时立即触发重连（不等待global monitor）
+			r.tryReconnectWebSocket()
+
 			return nil
 		}
 	}
@@ -574,8 +623,8 @@ func (r *Runner) adjustQuotesForRisk(symbol string, buyQuotes, sellQuotes []stra
 	// 计算当前仓位比例
 	posRatio := math.Abs(currentPos) / symCfg.NetMax
 
-	// 轻仓做市原则：最坏情况敞口不应超过NetMax的50%
-	maxWorstCase := symCfg.NetMax * 0.5
+	// 轻仓做市原则：最坏情况敞口不应超过NetMax的150%
+	maxWorstCase := symCfg.NetMax * 1.5 // 【修复】从0.5改为1.5，与风控保持一致
 
 	// 计算允许的最大挂单总量
 	var maxBuySize, maxSellSize float64
@@ -660,25 +709,45 @@ func (r *Runner) adjustQuotesForRisk(symbol string, buyQuotes, sellQuotes []stra
 	return adjustedBuyQuotes, adjustedSellQuotes
 }
 
-// onDepthUpdate 处理深度更新
+// onDepthUpdate 【P1-1】接收深度更新并发送到channel(非阻塞)
+// 这是WebSocket回调,必须快速返回,不能阻塞
 func (r *Runner) onDepthUpdate(depth *gateway.Depth) {
-	if depth == nil || len(depth.Bids) == 0 || len(depth.Asks) == 0 {
+	if depth == nil {
 		return
 	}
 
-	// 更新Store中的市场数据
-	bestBid := depth.Bids[0].Price
-	bestAsk := depth.Asks[0].Price
-	midPrice := (bestBid + bestAsk) / 2.0
+	// 【P1-1】非阻塞发送到channel
+	select {
+	case r.depthChan <- depth:
+		// 成功发送
 
-	r.store.UpdateMidPrice(depth.Symbol, midPrice, bestBid, bestAsk)
+		// 监控channel使用率
+		channelLen := len(r.depthChan)
+		channelCap := cap(r.depthChan)
+		if channelLen > int(float64(channelCap)*DEPTH_CHANNEL_WARNING_PCT) {
+			log.Warn().
+				Str("symbol", depth.Symbol).
+				Int("channel_len", channelLen).
+				Int("channel_cap", channelCap).
+				Float64("usage_pct", float64(channelLen)/float64(channelCap)*100).
+				Msg("【P1-1】深度channel使用率过高,接近背压")
+		}
 
-	log.Debug().
-		Str("symbol", depth.Symbol).
-		Float64("mid", midPrice).
-		Float64("bid", bestBid).
-		Float64("ask", bestAsk).
-		Msg("深度更新")
+	default:
+		// Channel满了,丢弃这条消息(背压保护)
+		atomic.AddInt64(&r.depthDropCount, 1)
+
+		// 每N条丢弃记录一次警告
+		if r.depthDropCount%DEPTH_DROP_LOG_INTERVAL == 1 {
+			log.Error().
+				Str("symbol", depth.Symbol).
+				Int64("total_drops", r.depthDropCount).
+				Msg("【P1-1】深度channel已满,丢弃消息(背压)")
+		}
+
+		// 记录到metrics
+		metrics.RecordError("depth_drop", depth.Symbol)
+	}
 }
 
 // onOrderUpdate 处理订单更新
@@ -829,8 +898,9 @@ func (r *Runner) monitorGlobalState() {
 			midPrice := state.MidPrice
 			state.Mu.RUnlock()
 
-			// 如果深度数据超过5秒未更新，说明WebSocket可能断流
-			if !lastUpdate.IsZero() && time.Since(lastUpdate) > 5*time.Second {
+			// 【修复断流】将检测阈值从5秒降低到2秒，更快检测断流
+			// 【关键修复】使用常量配置的阈值
+			if !lastUpdate.IsZero() && time.Since(lastUpdate) > time.Duration(STALE_PRICE_THRESHOLD_SECONDS)*time.Second {
 				log.Error().
 					Str("symbol", symbol).
 					Time("last_update", lastUpdate).
@@ -841,7 +911,7 @@ func (r *Runner) monitorGlobalState() {
 				// 记录错误
 				metrics.RecordError("websocket_stale", symbol)
 
-				// 触发WebSocket重连（带防抖）
+				// 【修复断流】触发WebSocket重连（移除防抖，立即重连）
 				r.tryReconnectWebSocket()
 			}
 		}
@@ -936,27 +1006,153 @@ func (r *Runner) logDashboardStats() {
 	}
 }
 
-// tryReconnectWebSocket 尝试重连WebSocket，带防抖机制
+// tryReconnectWebSocket 尝试重连WebSocket
+// 【P0-3】统一重连状态管理,使用指数退避算法,防止重复重连
 func (r *Runner) tryReconnectWebSocket() {
 	r.reconnectMu.Lock()
-	defer r.reconnectMu.Unlock()
 
-	// 防抖：距离上次重连至少30秒
-	if time.Since(r.lastReconnectTime) < 30*time.Second {
-		log.Debug().Msg("重连请求被防抖限制，距离上次重连时间过短")
+	// 检查是否已经有重连在进行中
+	if r.reconnectInProgress {
+		r.reconnectMu.Unlock()
+		log.Debug().Msg("重连已在进行中，跳过重复请求")
 		return
 	}
 
+	// 计算指数退避延迟: 2^attempts 秒, 最大64秒
+	backoffDelay := time.Duration(1<<uint(r.reconnectAttempts)) * time.Second
+	if backoffDelay > 64*time.Second {
+		backoffDelay = 64 * time.Second
+	}
+
+	// 检查是否需要等待退避时间
+	if !r.lastReconnectTime.IsZero() && time.Since(r.lastReconnectTime) < backoffDelay {
+		r.reconnectMu.Unlock()
+		log.Debug().
+			Dur("backoff", backoffDelay).
+			Dur("elapsed", time.Since(r.lastReconnectTime)).
+			Msg("重连请求被指数退避限制")
+		return
+	}
+
+	// 标记重连进行中
+	r.reconnectInProgress = true
 	r.lastReconnectTime = time.Now()
+	r.reconnectAttempts++
+	currentAttempt := r.reconnectAttempts
+	r.reconnectMu.Unlock()
 
 	// 在新 goroutine 中执行重连，避免阻塞
 	go func() {
-		log.Warn().Msg("尝试重连 WebSocket 流...")
+		log.Warn().
+			Int("attempt", currentAttempt).
+			Dur("backoff", backoffDelay).
+			Msg("【P0-3】开始WebSocket重连...")
+
 		ctx := context.Background()
-		if err := r.exchange.ReconnectStreams(ctx); err != nil {
-			log.Error().Err(err).Msg("WebSocket 重连失败")
+		err := r.exchange.ReconnectStreams(ctx)
+
+		r.reconnectMu.Lock()
+		r.reconnectInProgress = false
+		if err != nil {
+			r.reconnectFailCount++
+			log.Error().
+				Err(err).
+				Int("attempt", currentAttempt).
+				Int("fail_count", r.reconnectFailCount).
+				Msg("WebSocket重连失败")
+			metrics.RecordError("reconnect_fail", "websocket")
 		} else {
-			log.Info().Msg("WebSocket 重连成功")
+			// 重连成功,重置计数器
+			r.reconnectAttempts = 0
+			r.reconnectSuccessCount++
+			log.Info().
+				Int("success_count", r.reconnectSuccessCount).
+				Msg("【P0-3】WebSocket重连成功，计数器已重置")
 		}
+		r.reconnectMu.Unlock()
 	}()
+}
+
+// EnterSafeMode 进入安全模式，停止报价等待恢复
+func (r *Runner) EnterSafeMode(reason string) {
+	r.safeModeMu.Lock()
+	defer r.safeModeMu.Unlock()
+	if r.safeMode {
+		return
+	}
+	r.safeMode = true
+	r.safeModeReason = reason
+	log.Warn().Str("reason", reason).Msg("进入安全模式，暂停做市")
+}
+
+// ExitSafeMode 退出安全模式
+func (r *Runner) ExitSafeMode(reason string) {
+	r.safeModeMu.Lock()
+	defer r.safeModeMu.Unlock()
+	if !r.safeMode {
+		return
+	}
+	prev := r.safeModeReason
+	r.safeMode = false
+	r.safeModeReason = ""
+	log.Info().
+		Str("reason", reason).
+		Str("previous_reason", prev).
+		Msg("退出安全模式，恢复做市")
+}
+
+func (r *Runner) inSafeMode() (bool, string) {
+	r.safeModeMu.RLock()
+	defer r.safeModeMu.RUnlock()
+	return r.safeMode, r.safeModeReason
+}
+
+// ForceWebSocketReconnect 看门狗触发的WS重连
+func (r *Runner) ForceWebSocketReconnect(reason string) {
+	log.Warn().
+		Str("reason", reason).
+		Msg("看门狗触发WebSocket重连")
+	r.tryReconnectWebSocket()
+}
+
+// ForceResync 强制同步仓位/挂单，与交易所状态对齐
+func (r *Runner) ForceResync(reason string) {
+	log.Info().Str("reason", reason).Msg("看门狗触发全量状态同步")
+	go r.syncExchangeState()
+}
+
+func (r *Runner) syncExchangeState() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	positions, err := r.exchange.GetAllPositions(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("同步仓位失败")
+	} else {
+		r.applyPositions(positions)
+	}
+
+	for _, symCfg := range r.cfg.Symbols {
+		if err := r.om.SyncActiveOrders(ctx, symCfg.Symbol); err != nil {
+			log.Error().Err(err).Str("symbol", symCfg.Symbol).Msg("同步活跃订单失败")
+		}
+	}
+}
+
+func (r *Runner) applyPositions(positions []*gateway.Position) {
+	for _, pos := range positions {
+		if pos == nil {
+			continue
+		}
+		storePos := store.Position{
+			Symbol:         pos.Symbol,
+			Size:           pos.Size,
+			EntryPrice:     pos.EntryPrice,
+			UnrealizedPNL:  pos.UnrealizedPNL,
+			Notional:       pos.Notional,
+			Leverage:       pos.Leverage,
+			LastUpdateTime: time.Now(),
+		}
+		r.store.UpdatePosition(pos.Symbol, storePos)
+	}
 }

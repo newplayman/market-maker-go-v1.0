@@ -65,6 +65,10 @@ type SymbolState struct {
 	CancelCountLast int     // 最近一分钟撤单数
 	LastCancelReset time.Time
 
+	// 【P1-4】下单频率限制
+	PlaceCountLast int       // 最近一分钟下单数
+	LastPlaceReset time.Time // 上次下单计数重置时间
+
 	// 策略状态
 	LastMode string // 最后使用的策略模式 (normal/pinning/grinding)
 
@@ -560,7 +564,7 @@ func (s *Store) UpdateTrade(symbol string, trade Trade) {
 			state.Mu.RLock()
 			mid := state.MidPrice
 			state.Mu.RUnlock()
-			
+
 			if mid > 0 {
 				calc.UpdateMidPrice(mid)
 			}

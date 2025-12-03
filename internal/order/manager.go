@@ -350,6 +350,8 @@ func (om *OrderManager) ApplyDiff(ctx context.Context, symbol string, toCancel [
 				Float64("qty", order.Quantity).
 				Msg("下单失败")
 		} else {
+			// 【P1-4】下单成功后增加计数
+			om.store.IncrementPlaceCount(symbol)
 			placeSuccess++
 			log.Info().
 				Str("symbol", symbol).

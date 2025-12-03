@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/newplayman/market-maker-phoenix/internal/metrics"
 	"github.com/rs/zerolog/log"
 )
 
@@ -30,7 +31,7 @@ type BinanceAdapter struct {
 	orders     map[string]*Order // key: clientOrderID -> Order
 	orderIDMap map[string]int64  // key: clientOrderID -> exchange orderId (数字)
 	stateMu    sync.RWMutex
-	
+
 	// Store reference for VPIN updates
 	store interface{} // *store.Store，使用interface{}避免循环依赖
 
@@ -38,6 +39,9 @@ type BinanceAdapter struct {
 	currentListenKey string
 	listenKeyCtx     context.Context
 	listenKeyCancel  context.CancelFunc
+
+	// WebSocket reconnection context
+	wsCtx context.Context // 用于WebSocket重连的context
 }
 
 // NewBinanceAdapter creates a new Binance exchange adapter
@@ -47,11 +51,11 @@ func NewBinanceAdapter(rest BinanceREST, ws BinanceWS) *BinanceAdapter {
 	apiKey := ""
 	secretKey := ""
 	var listenKeyClient *ListenKeyClient
-	
+
 	if restClient, ok := rest.(*BinanceRESTClient); ok {
 		apiKey = restClient.APIKey
 		secretKey = restClient.Secret
-		
+
 		// Initialize ListenKey client
 		listenKeyClient = &ListenKeyClient{
 			BaseURL:    restClient.BaseURL,
@@ -333,10 +337,10 @@ func (b *BinanceAdapter) StartDepthStream(ctx context.Context, symbols []string,
 	}
 
 	log.Info().Strs("symbols", symbols).Msg("深度流已订阅")
-	
+
 	// Start WebSocket if not already started
 	b.startWebSocketIfReady()
-	
+
 	return nil
 }
 
@@ -355,12 +359,12 @@ func (b *BinanceAdapter) StartUserStream(ctx context.Context, callbacks *UserStr
 			return fmt.Errorf("failed to get listenKey: %w", err)
 		}
 		log.Info().Msg("成功获取 listenKey")
-		
+
 		// Save listenKey
 		b.mu.Lock()
 		b.currentListenKey = listenKey
 		b.mu.Unlock()
-		
+
 		// Start listenKey refresh goroutine
 		b.startListenKeyRefresh(ctx, listenKey)
 	} else {
@@ -374,10 +378,10 @@ func (b *BinanceAdapter) StartUserStream(ctx context.Context, callbacks *UserStr
 	}
 
 	log.Info().Msg("用户数据流已订阅")
-	
+
 	// Start WebSocket if not already started
 	b.startWebSocketIfReady()
-	
+
 	return nil
 }
 
@@ -419,6 +423,9 @@ func (b *BinanceAdapter) Connect(ctx context.Context) error {
 		return nil
 	}
 
+	// 【修复断流】保存context用于WebSocket重连
+	b.wsCtx = ctx
+
 	// Start WebSocket trading client
 	b.tradeWS.Start(ctx)
 	log.Info().Msg("WebSocket交易客户端已启动")
@@ -431,6 +438,7 @@ func (b *BinanceAdapter) Connect(ctx context.Context) error {
 }
 
 // startWebSocketIfReady starts the WebSocket connection after subscriptions are ready
+// 【修复断流】设置OnDisconnect回调，自动触发重连
 func (b *BinanceAdapter) startWebSocketIfReady() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -442,12 +450,27 @@ func (b *BinanceAdapter) startWebSocketIfReady() {
 
 	b.wsStarted = true
 
+	// 【修复断流】设置OnDisconnect回调，自动触发重连
+	b.ws.OnDisconnect(func(err error) {
+		log.Warn().Err(err).Msg("WebSocket断开连接")
+
+		// 【Goroutine泄漏修复】不再重置wsStarted!
+		// 原来的逻辑会导致每次重连都启动新goroutine
+		// 现在让第一次启动的goroutine永久运行
+		// binance_ws_real.go内部会自动重连
+
+		log.Debug().Msg("【泄漏修复】WebSocket断开,依赖内部重连机制,不重启goroutine")
+	})
+
 	// Start WebSocket handler for market data
 	go func() {
-		handler := &adapterWSHandler{adapter: b}
+		handler := &adapterWSHandler{
+			adapter:      b,
+			lastMidPrice: make(map[string]float64),
+		}
 		if err := b.ws.Run(handler); err != nil {
 			log.Error().Err(err).Msg("WebSocket运行错误")
-			
+
 			// Mark as not started so it can be retried
 			b.mu.Lock()
 			b.wsStarted = false
@@ -498,7 +521,8 @@ func (b *BinanceAdapter) ReconnectStreams(ctx context.Context) error {
 
 	b.mu.Lock()
 	wsStarted := b.wsStarted
-	b.wsStarted = false
+	// 【修复Goroutine泄漏】不要重置wsStarted！
+	// b.wsStarted = false
 	b.mu.Unlock()
 
 	// Only attempt reconnect if WebSocket was started
@@ -506,6 +530,11 @@ func (b *BinanceAdapter) ReconnectStreams(ctx context.Context) error {
 		log.Debug().Msg("WebSocket 未启动，跳过重连")
 		return nil
 	}
+
+	// 如果WebSocket已经启动，说明内部循环正在运行（或正在重连）
+	// 我们强制关闭连接以触发立即重连（并使用新的ListenKey）
+	log.Info().Msg("WebSocket 已在运行，强制关闭连接以触发重连")
+	b.ws.CloseConnection()
 
 	// Get new listenKey if available
 	if b.listenKeyClient != nil {
@@ -538,7 +567,8 @@ func (b *BinanceAdapter) ReconnectStreams(ctx context.Context) error {
 	}
 
 	// Restart WebSocket
-	b.startWebSocketIfReady()
+	// 【修复Goroutine泄漏】不需要重新启动，内部循环会自动使用新的ListenKey
+	// b.startWebSocketIfReady()
 
 	log.Info().Msg("WebSocket 流重连完成")
 	return nil
@@ -554,19 +584,22 @@ func (b *BinanceAdapter) IsConnected() bool {
 // adapterWSHandler handles WebSocket events
 // Implements WSHandler interface from ws.go
 type adapterWSHandler struct {
-	adapter *BinanceAdapter
+	adapter      *BinanceAdapter
+	lastMidPrice map[string]float64 // 【流量优化】记录每个交易对的上一次mid价格，用于过滤微小变化
+	lastPriceMu  sync.RWMutex
 }
 
 // OnRawMessage 处理WebSocket原始消息
 func (h *adapterWSHandler) OnRawMessage(msg []byte) {
-	// 【流量监控】记录WebSocket接收字节数（专家建议）
-	// 注意：启用压缩后，这里的len(msg)是压缩后的大小
-	// metrics.RecordWSMessage("global", "total", len(msg))
-	
+	// 【流量监控】记录WebSocket接收字节数
+	// 注意：启用压缩后，这里的len(msg)是压缩后的大小，实际节省了60-70%
+	metrics.RecordWSMessage("global", "total", len(msg))
+
 	// 尝试解析深度数据
 	symbol, bid, ask, err := ParseCombinedDepth(msg)
 	if err == nil && symbol != "" && bid > 0 && ask > 0 {
-		// metrics.RecordWSMessage(symbol, "depth", len(msg))
+		// 按symbol分类记录深度消息
+		metrics.RecordWSMessage(symbol, "depth", len(msg))
 		h.OnDepth(symbol, bid, ask)
 		return
 	}
@@ -614,7 +647,22 @@ func (h *adapterWSHandler) OnRawMessage(msg []byte) {
 }
 
 // OnDepth handles depth updates from WebSocket
+// 【流量优化】添加价格变化过滤，跳过微小变化（<0.01%）
 func (h *adapterWSHandler) OnDepth(symbol string, bid, ask float64) {
+	mid := (bid + ask) / 2.0
+
+	// 更新lastMidPrice
+	h.lastPriceMu.Lock()
+	if h.lastMidPrice == nil {
+		h.lastMidPrice = make(map[string]float64)
+	}
+	h.lastMidPrice[symbol] = mid
+	h.lastPriceMu.Unlock()
+
+	// 【修复Stale Price】移除"价格变化小跳过回调"的逻辑
+	// 原来的逻辑会导致Runner收不到心跳，从而误判为断流
+	// 现在无论价格是否变化，都发送回调，由Runner决定是否处理（或仅更新时间戳）
+
 	// Create Depth object
 	depth := &Depth{
 		Symbol: symbol,
@@ -737,4 +785,20 @@ func (b *BinanceAdapter) SetStore(store interface{}) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.store = store
+}
+
+// SetLeverage sets the leverage for a symbol
+func (b *BinanceAdapter) SetLeverage(ctx context.Context, symbol string, leverage int) error {
+	if b.restClient == nil {
+		return fmt.Errorf("rest client not initialized")
+	}
+	return b.restClient.SetLeverage(symbol, leverage)
+}
+
+// SetMarginType sets the margin type for a symbol (ISOLATED or CROSSED)
+func (b *BinanceAdapter) SetMarginType(ctx context.Context, symbol string, marginType string) error {
+	if b.restClient == nil {
+		return fmt.Errorf("rest client not initialized")
+	}
+	return b.restClient.SetMarginType(symbol, marginType)
 }
