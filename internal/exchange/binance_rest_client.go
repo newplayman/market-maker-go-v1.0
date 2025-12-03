@@ -925,6 +925,27 @@ func (c *BinanceRESTClient) applyRecvWindow(params map[string]string) {
 	}
 }
 
+// Ping 调用 /fapi/v1/ping 检测REST连通性
+func (c *BinanceRESTClient) Ping() error {
+	if c == nil || c.HTTPClient == nil {
+		return fmt.Errorf("http client not set")
+	}
+	req, err := http.NewRequest(http.MethodGet, c.BaseURL+"/fapi/v1/ping", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("ping status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (c *BinanceRESTClient) waitLimit() {
 	if c != nil && c.Limiter != nil {
 		c.Limiter.Wait()

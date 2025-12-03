@@ -17,6 +17,11 @@ var timeNowMillis = func() int64 { return time.Now().UnixMilli() }
 // 全局时间同步器（可被外部设置）
 var globalTimeSync *TimeSync
 
+// SetGlobalTimeSync 允许外部设置全局时间同步器
+func SetGlobalTimeSync(ts *TimeSync) {
+	globalTimeSync = ts
+}
+
 // SignParams 生成 Binance 所需的签名（API key/secret 外部提供）。
 func SignParams(params map[string]string, secret string) (string, string) {
 	// 添加 timestamp（若未提供）

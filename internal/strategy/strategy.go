@@ -2,7 +2,6 @@ package strategy
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"sync"
 
@@ -34,6 +33,10 @@ type ASMM struct {
 	// 状态记忆，用于减少抖动
 	mu                  sync.RWMutex
 	lastInventoryRatios map[string]float64
+
+	// VPIN支持（可选）
+	vpinCalculators map[string]*VPINCalculator // per-symbol VPIN计算器
+	vpinMu          sync.RWMutex               // VPIN相关操作的锁
 }
 
 // NewASMM 创建ASMM策略实例
@@ -42,6 +45,7 @@ func NewASMM(cfg *config.Config, st *store.Store) *ASMM {
 		cfg:                 cfg,
 		store:               st,
 		lastInventoryRatios: make(map[string]float64),
+		vpinCalculators:     make(map[string]*VPINCalculator),
 	}
 }
 
@@ -72,13 +76,15 @@ func (a *ASMM) GenerateQuotes(ctx context.Context, symbol string) ([]Quote, []Qu
 	// 这是最后一道防线，防止持仓失控导致强平
 	posRatio := math.Abs(pos) / symCfg.NetMax
 	if posRatio > 0.80 {
-		log.Error().
+		log.Warn().
 			Str("symbol", symbol).
 			Float64("pos", pos).
 			Float64("net_max", symCfg.NetMax).
 			Float64("pos_ratio", posRatio*100).
-			Msg("【紧急熔断】持仓超过80% netMax，停止报价以防止持仓继续扩大")
-		return nil, nil, fmt.Errorf("紧急熔断: 持仓使用率%.1f%%超过80%%阈值，停止报价", posRatio*100)
+			Msg("【紧急熔断警告】持仓超过80% netMax，将仅允许减仓")
+		// 【修复】不要停止报价，否则无法减仓！
+		// 后续的adjustQuotesForRisk会负责过滤掉加仓单
+		// return nil, nil, fmt.Errorf("紧急熔断: 持仓使用率%.1f%%超过80%%阈值，停止报价", posRatio*100)
 	}
 
 	// 如果持仓超过50%，记录警告日志
@@ -111,6 +117,35 @@ func (a *ASMM) GenerateQuotes(ctx context.Context, symbol string) ([]Quote, []Qu
 		spread = symCfg.MinSpread * mid
 	}
 
+	// 【VPIN集成】检查VPIN并调整价差或暂停报价
+	vpinValue := a.getVPIN(symbol)
+	isGrindingMode := a.ShouldStartGrinding(symbol)
+
+	// VPIN暂停检查（Grinding模式豁免）
+	// 根据计划：Grinding > VPIN暂停，确保减仓优先
+	if vpinValue >= 0.9 && !isGrindingMode {
+		log.Warn().
+			Str("symbol", symbol).
+			Float64("vpin", vpinValue).
+			Float64("pos_ratio", posRatio).
+			Msg("【VPIN警报】毒性过高，暂停报价")
+		return nil, nil, ErrHighVPINToxicity
+	}
+
+	// VPIN价差调整（所有模式都应用）
+	if vpinValue >= 0.7 {
+		vpinMultiplier := 1.0 + vpinValue*0.2
+		spread *= vpinMultiplier
+
+		log.Info().
+			Str("symbol", symbol).
+			Float64("vpin", vpinValue).
+			Float64("spread_multiplier", vpinMultiplier).
+			Float64("original_spread", spread/vpinMultiplier).
+			Float64("adjusted_spread", spread).
+			Msg("【VPIN调整】订单流毒性检测，扩大价差")
+	}
+
 	// 模式优先级判断：Grinding > Pinning > Normal
 	// Grinding优先级最高（仓位最危险，需要主动减仓）
 	// Pinning次之（仓位较大，需要被动等待）
@@ -120,7 +155,7 @@ func (a *ASMM) GenerateQuotes(ctx context.Context, symbol string) ([]Quote, []Qu
 	var err error
 	var mode string
 
-	if a.ShouldStartGrinding(symbol) {
+	if isGrindingMode {
 		// Grinding模式：主动减仓
 		mode = "grinding"
 		buyQuotes, sellQuotes, err = a.GenerateGrindingQuotes(symbol, mid)
@@ -585,7 +620,12 @@ func (a *ASMM) generatePinningQuotes(bestBid, bestAsk float64, pos float64, cfg 
 	sellQuotes := make([]Quote, 0)
 
 	// 钉子大小：基础大小 * 2.3
-	pinSize := cfg.BaseLayerSize * 2.3
+	baseSize := cfg.BaseLayerSize
+	if baseSize <= 0 {
+		baseSize = cfg.UnifiedLayerSize
+	}
+	pinSize := baseSize * 2.3
+	pinSize = a.roundQty(pinSize, cfg.MinQty)
 
 	if pos > 0 {
 		// 多头仓位：钉在卖价
@@ -656,6 +696,15 @@ func (a *ASMM) roundPrice(price, tickSize float64) float64 {
 	return math.Round(price/tickSize) * tickSize
 }
 
+// roundQty 数量对齐到stepSize
+func (a *ASMM) roundQty(qty, stepSize float64) float64 {
+	if stepSize <= 0 {
+		return qty
+	}
+	// 使用Round确保最接近，避免精度误差
+	return math.Round(qty/stepSize) * stepSize
+}
+
 // logModeChange 记录模式切换
 func (a *ASMM) logModeChange(symbol, mode string, pos, netMax float64) {
 	state := a.store.GetSymbolState(symbol)
@@ -686,4 +735,68 @@ func (a *ASMM) logModeChange(symbol, mode string, pos, netMax float64) {
 // UpdateMetrics 更新指标
 func (a *ASMM) UpdateMetrics() {
 	// 由metrics模块处理
+}
+
+// EnableVPIN 为指定symbol启用VPIN
+func (a *ASMM) EnableVPIN(symbol string, cfg VPINConfig) {
+	a.vpinMu.Lock()
+	defer a.vpinMu.Unlock()
+
+	// 创建VPIN计算器
+	calc := NewVPINCalculator(symbol, cfg)
+	a.vpinCalculators[symbol] = calc
+
+	// 注册到Store
+	a.store.EnableVPIN(symbol, calc)
+
+	log.Info().
+		Str("symbol", symbol).
+		Float64("bucket_size", cfg.BucketSize).
+		Float64("threshold", cfg.Threshold).
+		Msg("VPIN已启用")
+}
+
+// DisableVPIN 为指定symbol禁用VPIN
+func (a *ASMM) DisableVPIN(symbol string) {
+	a.vpinMu.Lock()
+	defer a.vpinMu.Unlock()
+
+	delete(a.vpinCalculators, symbol)
+	a.store.DisableVPIN(symbol)
+
+	log.Info().Str("symbol", symbol).Msg("VPIN已禁用")
+}
+
+// getVPIN 获取指定symbol的VPIN值（内部方法）
+func (a *ASMM) getVPIN(symbol string) float64 {
+	a.vpinMu.RLock()
+	calc, exists := a.vpinCalculators[symbol]
+	a.vpinMu.RUnlock()
+
+	if !exists || calc == nil {
+		return 0.5 // 未启用时返回中性值
+	}
+
+	return calc.GetVPIN()
+}
+
+// GetVPINStats 获取VPIN统计信息（供外部调用）
+func (a *ASMM) GetVPINStats(symbol string) *VPINStats {
+	a.vpinMu.RLock()
+	calc, exists := a.vpinCalculators[symbol]
+	a.vpinMu.RUnlock()
+
+	if !exists || calc == nil {
+		return nil
+	}
+
+	stats := calc.GetStats()
+	return &stats
+}
+
+// GetVPINCalculator 获取VPIN计算器（供测试使用）
+func (a *ASMM) GetVPINCalculator(symbol string) *VPINCalculator {
+	a.vpinMu.RLock()
+	defer a.vpinMu.RUnlock()
+	return a.vpinCalculators[symbol]
 }

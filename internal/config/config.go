@@ -66,6 +66,15 @@ type SymbolConfig struct {
 
 	// 库存偏移系数 - 增强成交后逼近盘口的效果
 	InventorySkewCoeff float64 `mapstructure:"inventory_skew_coeff"` // 库存偏移系数 (默认0.002)
+
+	// VPIN配置（可选，默认禁用）
+	VPINEnabled       bool    `mapstructure:"vpin_enabled"`        // 是否启用VPIN
+	VPINBucketSize    float64 `mapstructure:"vpin_bucket_size"`    // Bucket大小（成交量）
+	VPINNumBuckets    int     `mapstructure:"vpin_num_buckets"`    // Bucket数量
+	VPINThreshold     float64 `mapstructure:"vpin_threshold"`      // 警报阈值
+	VPINPauseThresh   float64 `mapstructure:"vpin_pause_thresh"`   // 暂停阈值
+	VPINMultiplier    float64 `mapstructure:"vpin_multiplier"`     // Spread放大系数
+	VPINVolThreshold  float64 `mapstructure:"vpin_vol_threshold"`  // 最小成交量要求
 }
 
 var (
@@ -141,8 +150,8 @@ func validateConfig(cfg *Config) error {
 		if sym.Symbol == "" {
 			return fmt.Errorf("symbols[%d]: symbol 不能为空", i)
 		}
-		if sym.NetMax <= 0.1 {
-			return fmt.Errorf("symbols[%d]: net_max 必须 > 0.1", i)
+		if sym.NetMax <= 0.001 {
+			return fmt.Errorf("symbols[%d]: net_max 必须 > 0.001（支持不同币种价格）", i)
 		}
 		if sym.MinSpread <= 0 || sym.MinSpread > 0.01 {
 			return fmt.Errorf("symbols[%d]: min_spread 必须在 (0, 0.01] 之间", i)

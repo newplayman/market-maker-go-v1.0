@@ -144,6 +144,15 @@ var (
 		[]string{"symbol"},
 	)
 
+	DepthProcessing = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "phoenix_depth_processing_duration_seconds",
+			Help:    "深度数据处理耗时",
+			Buckets: []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1}, // 更细粒度的buckets
+		},
+		[]string{"symbol"},
+	)
+
 	OrderPlacement = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "phoenix_order_placement_duration_seconds",
@@ -194,6 +203,64 @@ var (
 		},
 		[]string{"symbol"},
 	)
+
+	// VPIN指标
+	VPINCurrent = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "phoenix_vpin_current",
+			Help: "当前VPIN值（0-1，越高表示订单流毒性越大）",
+		},
+		[]string{"symbol"},
+	)
+
+	VPINBucketCount = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "phoenix_vpin_bucket_count",
+			Help: "已填充的VPIN buckets数量",
+		},
+		[]string{"symbol"},
+	)
+
+	VPINPauseCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "phoenix_vpin_pause_total",
+			Help: "因VPIN过高而暂停报价的次数",
+		},
+		[]string{"symbol"},
+	)
+
+	VPINSpreadMultiplier = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "phoenix_vpin_spread_multiplier",
+			Help: "VPIN引起的价差放大倍数",
+		},
+		[]string{"symbol"},
+	)
+
+	// WebSocket流量监控（专家建议：防止数据雪球）
+	WSBytesReceived = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "phoenix_ws_bytes_received_total",
+			Help: "WebSocket接收字节数（下行流量）",
+		},
+		[]string{"symbol"},
+	)
+
+	WSMessageCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "phoenix_ws_message_count_total",
+			Help: "WebSocket消息数量（按类型统计）",
+		},
+		[]string{"symbol", "type"}, // type: depth, trade, order, account
+	)
+
+	WSBandwidthRate = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "phoenix_ws_bandwidth_bytes_per_min",
+			Help: "WebSocket带宽速率（字节/分钟）",
+		},
+		[]string{"symbol"},
+	)
 )
 
 func init() {
@@ -215,12 +282,20 @@ func init() {
 		MaxDrawdown,
 		CancelRate,
 		QuoteGeneration,
+		DepthProcessing,
 		OrderPlacement,
 		APILatency,
 		ErrorCount,
 		StrategyMode,
 		InventorySkew,
 		VolatilityScaling,
+		VPINCurrent,
+		VPINBucketCount,
+		VPINPauseCount,
+		VPINSpreadMultiplier,
+		WSBytesReceived,
+		WSMessageCount,
+		WSBandwidthRate,
 	)
 }
 
@@ -269,4 +344,27 @@ func UpdateMarketMetrics(symbol string, mid, spread, funding float64) {
 	MidPrice.WithLabelValues(symbol).Set(mid)
 	PriceSpread.WithLabelValues(symbol).Set(spread)
 	FundingRate.WithLabelValues(symbol).Set(funding)
+}
+
+// UpdateVPINMetrics 更新VPIN指标
+func UpdateVPINMetrics(symbol string, vpin float64, bucketCount int, spreadMultiplier float64) {
+	VPINCurrent.WithLabelValues(symbol).Set(vpin)
+	VPINBucketCount.WithLabelValues(symbol).Set(float64(bucketCount))
+	VPINSpreadMultiplier.WithLabelValues(symbol).Set(spreadMultiplier)
+}
+
+// IncrementVPINPauseCount 增加VPIN暂停计数
+func IncrementVPINPauseCount(symbol string) {
+	VPINPauseCount.WithLabelValues(symbol).Inc()
+}
+
+// RecordWSMessage 记录WebSocket消息
+func RecordWSMessage(symbol, msgType string, bytes int) {
+	WSBytesReceived.WithLabelValues(symbol).Add(float64(bytes))
+	WSMessageCount.WithLabelValues(symbol, msgType).Inc()
+}
+
+// UpdateWSBandwidthRate 更新WebSocket带宽速率（每分钟调用）
+func UpdateWSBandwidthRate(symbol string, bytesPerMin float64) {
+	WSBandwidthRate.WithLabelValues(symbol).Set(bytesPerMin)
 }

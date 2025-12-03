@@ -17,6 +17,8 @@ type BinanceWS interface {
 	SubscribeDepth(symbol string) error
 	SubscribeUserData(listenKey string) error
 	Run(handler WSHandler) error
+	OnDisconnect(cb func(error)) // 【修复断流】设置断开连接回调
+	CloseConnection()            // 【修复Goroutine泄漏】强制关闭连接
 }
 
 // BinanceClient 聚合 REST 与 WS；这里为占位骨架，方便后续替换为真实实现。

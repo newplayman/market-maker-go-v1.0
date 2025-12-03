@@ -86,11 +86,16 @@ type Exchange interface {
 	// WebSocket streams
 	StartDepthStream(ctx context.Context, symbols []string, callback func(*Depth)) error
 	StartUserStream(ctx context.Context, callbacks *UserStreamCallbacks) error
+	ReconnectStreams(ctx context.Context) error
 
 	// Connection management
 	Connect(ctx context.Context) error
 	Disconnect() error
 	IsConnected() bool
+
+	// Account management
+	SetLeverage(ctx context.Context, symbol string, leverage int) error
+	SetMarginType(ctx context.Context, symbol string, marginType string) error
 }
 
 // UserStreamCallbacks defines callbacks for user stream events

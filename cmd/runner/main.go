@@ -16,6 +16,7 @@ import (
 	"github.com/newplayman/market-maker-phoenix/internal/runner"
 	"github.com/newplayman/market-maker-phoenix/internal/store"
 	"github.com/newplayman/market-maker-phoenix/internal/strategy"
+	"github.com/newplayman/market-maker-phoenix/internal/watchdog"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -86,6 +87,27 @@ func main() {
 	strat := strategy.NewASMM(cfg, st)
 	log.Info().Msg("策略创建完成")
 
+	// 根据配置启用VPIN
+	for _, symCfg := range cfg.Symbols {
+		if symCfg.VPINEnabled {
+			vpinCfg := strategy.VPINConfig{
+				BucketSize:   symCfg.VPINBucketSize,
+				NumBuckets:   symCfg.VPINNumBuckets,
+				Threshold:    symCfg.VPINThreshold,
+				PauseThresh:  symCfg.VPINPauseThresh,
+				Multiplier:   symCfg.VPINMultiplier,
+				VolThreshold: symCfg.VPINVolThreshold,
+			}
+			strat.EnableVPIN(symCfg.Symbol, vpinCfg)
+			log.Info().
+				Str("symbol", symCfg.Symbol).
+				Float64("bucket_size", vpinCfg.BucketSize).
+				Int("num_buckets", vpinCfg.NumBuckets).
+				Float64("threshold", vpinCfg.Threshold).
+				Msg("VPIN已为交易对启用")
+		}
+	}
+
 	// 创建风控管理器
 	log.Info().Msg("创建风控管理器...")
 	riskMgr := risk.NewRiskManager(cfg, st)
@@ -102,10 +124,22 @@ func main() {
 		APIKey:       cfg.Global.APIKey,
 		Secret:       cfg.Global.APISecret,
 		HTTPClient:   &http.Client{Timeout: 10 * time.Second},
-		RecvWindowMs: 5000,
+		RecvWindowMs: 10000,
 		Limiter:      gateway.NewCompositeLimiter(20, 100, 100, 1200), // rate=20/s, burst=100, max10s=100, max60s=1200
 		MaxRetries:   3,
 		RetryDelay:   time.Second,
+	}
+
+	// 同步服务器时间，避免-1021错误
+	timeSync := gateway.NewTimeSync(rest.BaseURL)
+	if err := timeSync.Sync(); err != nil {
+		log.Warn().Err(err).Msg("同步Binance服务器时间失败，将继续使用本地时间")
+	} else {
+		rest.TimeSync = timeSync
+		gateway.SetGlobalTimeSync(timeSync)
+		log.Info().
+			Int64("offset_ms", timeSync.GetOffset()).
+			Msg("已完成服务器时间同步")
 	}
 
 	// 创建WebSocket客户端
@@ -129,6 +163,23 @@ func main() {
 	}
 
 	log.Info().Msg("Phoenix系统启动完成，开始做市...")
+
+	wd := watchdog.NewWatchdog(
+		watchdog.Config{
+			RestPingInterval:      15 * time.Second,
+			RestFailureThreshold:  3,
+			RestRecoveryThreshold: 2,
+			WsCheckInterval:       5 * time.Second,
+			WsStaleThreshold:      6 * time.Second,
+			WsFailureThreshold:    3,
+			WsRecoveryThreshold:   2,
+		},
+		rest,
+		st,
+		r,
+	)
+	wd.Start(ctx)
+	defer wd.Stop()
 
 	// 等待退出信号
 	sigCh := make(chan os.Signal, 1)

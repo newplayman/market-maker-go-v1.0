@@ -1,106 +1,156 @@
-# Phoenix v2 实盘配置 - ETHUSDC Maker免费策略
-# 测试资金: 1000 USDC, 20X杠杆
+﻿# Phoenix v2 实盘配置 - 5交易对均衡版
+# 账户保证金: 1000 USDC, 20X杠杆
+# 交易对: ETH, SOL, BNB, XRP, DOGE
 #
-# 【风控修复说明 - 2025-12-02】
-# 1. net_max从1.50降低到0.50 ETH（降低67%），避免单边行情强平
-# 2. grinding_thresh从60%降低到30%，更早启动减仓机制
-# 3. 代码层面增加：
-#    - 持仓绝对值检查（超标只允许减仓）
-#    - 紧急熔断机制（80%持仓使用率停止报价）
-#    - grinding波动率限制放宽（0.38%→1%）
-#    - 50%持仓使用率警告日志
-#
-# 风控触发点（基于net_max=0.50 ETH, @2800价格）：
-# - 30%触发grinding（0.15 ETH = 420 USDC名义 = 21 USDC保证金 = 2.1%资金）
-# - 50%触发pinning + 警告（0.25 ETH = 700 USDC名义 = 35 USDC保证金 = 3.5%资金）
-# - 80%触发熔断（0.40 ETH = 1120 USDC名义 = 56 USDC保证金 = 5.6%资金）
-# - 100%强制只允许减仓（0.50 ETH = 1400 USDC名义 = 70 USDC保证金 = 7%资金）
+# 【资金分配原则】
+# - 每个交易对约 20% 资金占比（~800 USDC 名义）
+# - 单边 7 层几何网格（双边 14 层），单笔 25~32 USDC
+# - 撤单限制依托币安 200 次/分钟 => 每个交易对 40 次
 
 global:
   # ==================== 网络配置 ====================
   testnet: false                            # 实盘模式
   
   # ==================== 风控配置 ====================
-  total_notional_max: 1000.0                 # 总名义价值上限 180 (190 USDC测试资金)
+  total_notional_max: 4000.0                # 5 交易对 * ~800 USDC
   
   # ==================== 报价配置 ====================
-  quote_interval_ms: 1000                   # 报价间隔 1000ms (1秒，降低撤单频率)
+  quote_interval_ms: 1000                   # 报价间隔 1000ms
   
   # ==================== 监控配置 ====================
   metrics_port: 9090                        # Prometheus监控端口
   
   # ==================== 持久化配置 ====================
-  snapshot_path: "./data/snapshot_mainnet.json"  # 实盘快照路径
-  snapshot_interval: 60                           # 快照间隔60秒
+  snapshot_path: "./data/snapshot_mainnet.json"
+  snapshot_interval: 60
   
   # ==================== 日志配置 ====================
-  log_level: "info"                         # 日志级别
+  log_level: "info"
 
 # ==================== 交易对配置 ====================
-# ETHUSDC永续合约 - Maker免手续费策略
 symbols:
-  - symbol: "ETHUSDC"                       # 交易对
-    
-    # 【修复4】仓位限制（适配1000 USDC资金，20X杠杆）
-    # 降低到0.50 ETH以保护本金安全，避免单边行情导致强平
-    # 计算：0.50 ETH × 2800价格 = 1400 USDC名义值 = 70 USDC保证金（7%资金使用率）
-    net_max: 0.50                           # 最大净仓位 0.50 ETH (从1.50降低到0.50，提高安全性)
-    
-    # 价差配置
-    min_spread: 0.0007                      # 最小价差 0.07%
 
-    # 价格和数量精度
-    tick_size: 0.01                         # 价格最小变动 $0.01
-    min_qty: 0.005                          # 最小下单量 0.001 ETH
+  # ==============================================
+  # 1. ETHUSDC (~30U/单, ~800U netMax)
+  # ==============================================
+  - symbol: "ETHUSDC"
+    net_max: 0.26                           # 0.26 ETH @3050 ≈ 790U
+    min_spread: 0.0012
+    tick_size: 0.01
+    min_qty: 0.001
     
-    # ====================【新】统一几何网格配置====================
-    # 买卖各7层，共14层订单
-    # 资金占用：14层 × 96.25U/层 = 1347.5U名义价值 = 67.4U保证金（6.74%资金占用，@20X杠杆）
-    # 批量风控限制：net_max × 0.5 = 0.50 × 0.5 = 0.25 ETH
-    # 实际挂单总量：7 × 0.035 = 0.245 ETH < 0.25 ETH ✅ 通过风控
-    total_layers: 7                         # 单边层数 7（共14层订单）
-    unified_layer_size: 0.035               # 统一层大小 0.035 ETH ≈ 96.25U @ 2750价格
-    grid_start_offset: 1.2                  # 第1层距离mid 1.2 USDT
-    grid_first_spacing: 1.2                 # 第1-2层间距 1.2 USDT
-    grid_spacing_multiplier: 1.15           # 几何系数 1.15（每层间距×1.15）
-    grid_max_spacing: 25.0                  # 最大层间距 25 USDT
+    total_layers: 7
+    unified_layer_size: 0.01                # ≈30U/单
+    grid_start_offset: 1.85
+    grid_first_spacing: 1.6
+    grid_spacing_multiplier: 1.25
+    grid_max_spacing: 35.0
     
-    # 计算示例（@mid=3000 USDT）：
-    # 层1: 距mid 1.2U，买价=2998.8，卖价=3001.2
-    # 层2: 距mid 1.2+1.2=2.4U，买价=2997.6，卖价=3002.4
-    # 层3: 距mid 2.4+1.2*1.15=3.78U，买价=2996.22，卖价=3003.78
-    # 层4: 距mid 3.78+1.2*1.15²=5.365U
-    # 层5: 距mid 5.365+1.2*1.15³=6.89U
-    # 层6: 距mid 6.89+1.2*1.15⁴=8.62U
-    # 层7: 距mid 8.62+1.2*1.15⁵=10.57U（最后一层）
+    pinning_enabled: true
+    pinning_thresh: 0.5
+    grinding_enabled: true
+    grinding_thresh: 0.65
+    stop_loss_thresh: 0.05
+    max_cancel_per_min: 40
+    inventory_skew_coeff: 0.006
+    vol_smoothing_alpha: 0.02
+
+  # ==============================================
+  # 2. SOLUSDC (~28U/单, ~800U netMax)
+  # ==============================================
+  - symbol: "SOLUSDC"
+    net_max: 5.5                            # 5.5 SOL @142 ≈ 780U
+    min_spread: 0.0011
+    tick_size: 0.01
+    min_qty: 0.1
     
-    # ====================【废弃】旧配置（保留兼容性）====================
-    # 以下参数仅在未配置新参数时生效
-    base_layer_size: 0.01                   # 废弃：使用unified_layer_size
-    near_layers: 8                          # 废弃：使用total_layers
-    far_layers: 16                          # 废弃：使用total_layers
-    far_layer_size: 0.01                    # 废弃：使用unified_layer_size
-    near_layer_start_offset: 0.0004         # 废弃
-    near_layer_spacing_ratio: 1.35          # 废弃
-    far_layer_start_offset: 0.0015          # 废弃
-    far_layer_end_offset: 0.025             # 废弃
-    layer_spacing_mode: geometric           # 废弃
-    spacing_ratio: 1.1                      # 废弃
+    total_layers: 7
+    unified_layer_size: 0.2                 # ≈28U/单
+    grid_start_offset: 0.13
+    grid_first_spacing: 0.13
+    grid_spacing_multiplier: 1.25
+    grid_max_spacing: 3.0
     
-    # ====================Pinning/Grinding配置====================
-    # 【修复2】配置约束：pinning_thresh ∈ [0.5, 0.95]，grinding_thresh > pinning_thresh
-    # 由于配置验证限制，无法将阈值降得更低，但配合代码层面的修复仍能大幅提升安全性
-    pinning_enabled: true                   # 启用钉子模式
-    pinning_thresh: 0.50                    # 50% NetMax触发（0.25 ETH = 700 USDC @ 2800价格）
-    grinding_enabled: true                  # 启用磨仓模式
-    grinding_thresh: 0.60                   # 60% NetMax触发（0.30 ETH = 840 USDC @ 2800价格）
-                                            # 保持原值，但波动率限制已放宽到1%，更容易触发
+    pinning_enabled: true
+    pinning_thresh: 0.5
+    grinding_enabled: true
+    grinding_thresh: 0.65
+    stop_loss_thresh: 0.05
+    max_cancel_per_min: 40
+    inventory_skew_coeff: 0.005
+    vol_smoothing_alpha: 0.02
+
+  # ==============================================
+  # 3. BNBUSDC (~31U/单, ~800U netMax)
+  # ==============================================
+  - symbol: "BNBUSDC"
+    net_max: 0.9                            # 0.9 BNB @895 ≈ 805U
+    min_spread: 0.00085
+    tick_size: 0.1
+    min_qty: 0.01
     
-    # 止损配置
-    stop_loss_thresh: 0.05                  # 止损阈值 5%
+    total_layers: 7
+    unified_layer_size: 0.04                # ≈36U/单 (满足0.01步进)
+    grid_start_offset: 0.43
+    grid_first_spacing: 0.34
+    grid_spacing_multiplier: 1.25
+    grid_max_spacing: 12.0
     
-    # 撤单限制
-    max_cancel_per_min: 200                 # 每分钟最大撤单数 (已调整为200以适配36层网格)
+    pinning_enabled: true
+    pinning_thresh: 0.5
+    grinding_enabled: true
+    grinding_thresh: 0.65
+    stop_loss_thresh: 0.05
+    max_cancel_per_min: 40
+    inventory_skew_coeff: 0.005
+    vol_smoothing_alpha: 0.02
+
+  # ==============================================
+  # 4. XRPUSDC (~26U/单, ~800U netMax)
+  # ==============================================
+  - symbol: "XRPUSDC"
+    net_max: 360.0                          # 360 XRP @2.2 ≈ 792U
+    min_spread: 0.0011
+    tick_size: 0.0001
+    min_qty: 1.0
     
-    # 库存偏移系数（ASMM策略参数）
-    inventory_skew_coeff: 0.002             # 库存偏移系数（默认0.002）
+    total_layers: 7
+    unified_layer_size: 12.0                # ≈26U/单
+    grid_start_offset: 0.0020
+    grid_first_spacing: 0.0016
+    grid_spacing_multiplier: 1.25
+    grid_max_spacing: 0.07
+    
+    pinning_enabled: true
+    pinning_thresh: 0.5
+    grinding_enabled: true
+    grinding_thresh: 0.65
+    stop_loss_thresh: 0.05
+    max_cancel_per_min: 40
+    inventory_skew_coeff: 0.004
+    vol_smoothing_alpha: 0.02
+
+  # ==============================================
+  # 5. DOGEUSDC (~30U/单, ~800U netMax)
+  # ==============================================
+  - symbol: "DOGEUSDC"
+    net_max: 5200.0                         # 5200 DOGE @0.15 ≈ 780U
+    min_spread: 0.0014
+    tick_size: 0.00001
+    min_qty: 10.0
+    
+    total_layers: 7
+    unified_layer_size: 200.0               # ≈30U/单
+    grid_start_offset: 0.00022
+    grid_first_spacing: 0.00018
+    grid_spacing_multiplier: 1.25
+    grid_max_spacing: 0.012
+    
+    pinning_enabled: true
+    pinning_thresh: 0.5
+    grinding_enabled: true
+    grinding_thresh: 0.65
+    stop_loss_thresh: 0.05
+    max_cancel_per_min: 40
+    inventory_skew_coeff: 0.003
+    vol_smoothing_alpha: 0.02
