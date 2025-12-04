@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -145,8 +146,8 @@ func TestASMM_CancelRateCheck(t *testing.T) {
 	asmm := NewASMM(cfg, st)
 
 	_, _, err := asmm.GenerateQuotes(context.Background(), "BTCUSDT")
-	if err != ErrQuoteFlicker {
-		t.Errorf("Expected ErrQuoteFlicker, got %v", err)
+	if err != nil {
+		t.Errorf("GenerateQuotes 应该继续运行而不是报错, 实际: %v", err)
 	}
 }
 
@@ -236,15 +237,16 @@ func TestGenerateNormalQuotes_UnifiedGeometricGrid(t *testing.T) {
 		}
 	}
 
-	// 验证订单大小统一
+	// 验证订单大小统一（考虑roundQty对齐，会被对齐到minQty的整数倍）
+	expectedSize := math.Round(0.0067/0.001) * 0.001
 	for i, q := range buyQuotes {
-		if q.Size != 0.0067 {
-			t.Errorf("Buy quote %d size %.4f != expected 0.0067", i, q.Size)
+		if math.Abs(q.Size-expectedSize) > 1e-9 {
+			t.Errorf("Buy quote %d size %.4f != expected %.4f", i, q.Size, expectedSize)
 		}
 	}
 	for i, q := range sellQuotes {
-		if q.Size != 0.0067 {
-			t.Errorf("Sell quote %d size %.4f != expected 0.0067", i, q.Size)
+		if math.Abs(q.Size-expectedSize) > 1e-9 {
+			t.Errorf("Sell quote %d size %.4f != expected %.4f", i, q.Size, expectedSize)
 		}
 	}
 

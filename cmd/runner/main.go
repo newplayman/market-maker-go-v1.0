@@ -148,9 +148,26 @@ func main() {
 	// 创建适配器
 	exchange := gateway.NewBinanceAdapter(rest, ws)
 
-	// 启动Prometheus监控
-	if err := metrics.StartMetricsServer(cfg.Global.MetricsPort); err != nil {
-		log.Error().Err(err).Msg("启动监控服务器失败")
+	// 启动Prometheus监控，端口冲突时自动降级
+	defaultMetricsPort := cfg.Global.MetricsPort
+	if defaultMetricsPort == 0 {
+		defaultMetricsPort = 9090
+	}
+	if _, err := metrics.StartMetricsServer(defaultMetricsPort); err != nil {
+		log.Warn().
+			Err(err).
+			Int("port", defaultMetricsPort).
+			Msg("监控端口被占用，尝试使用系统分配端口")
+
+		if fallbackPort, fallbackErr := metrics.StartMetricsServer(0); fallbackErr != nil {
+			log.Error().
+				Err(fallbackErr).
+				Msg("Prometheus监控未能启动，将跳过指标暴露")
+		} else {
+			log.Info().
+				Int("port", fallbackPort).
+				Msg("Prometheus监控已在备用端口启动")
+		}
 	}
 
 	// 创建Runner

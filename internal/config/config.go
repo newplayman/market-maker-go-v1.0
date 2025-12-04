@@ -68,13 +68,21 @@ type SymbolConfig struct {
 	InventorySkewCoeff float64 `mapstructure:"inventory_skew_coeff"` // 库存偏移系数 (默认0.002)
 
 	// VPIN配置（可选，默认禁用）
-	VPINEnabled       bool    `mapstructure:"vpin_enabled"`        // 是否启用VPIN
-	VPINBucketSize    float64 `mapstructure:"vpin_bucket_size"`    // Bucket大小（成交量）
-	VPINNumBuckets    int     `mapstructure:"vpin_num_buckets"`    // Bucket数量
-	VPINThreshold     float64 `mapstructure:"vpin_threshold"`      // 警报阈值
-	VPINPauseThresh   float64 `mapstructure:"vpin_pause_thresh"`   // 暂停阈值
-	VPINMultiplier    float64 `mapstructure:"vpin_multiplier"`     // Spread放大系数
-	VPINVolThreshold  float64 `mapstructure:"vpin_vol_threshold"`  // 最小成交量要求
+	VPINEnabled      bool    `mapstructure:"vpin_enabled"`       // 是否启用VPIN
+	VPINBucketSize   float64 `mapstructure:"vpin_bucket_size"`   // Bucket大小（成交量）
+	VPINNumBuckets   int     `mapstructure:"vpin_num_buckets"`   // Bucket数量
+	VPINThreshold    float64 `mapstructure:"vpin_threshold"`     // 警报阈值
+	VPINPauseThresh  float64 `mapstructure:"vpin_pause_thresh"`  // 暂停阈值
+	VPINMultiplier   float64 `mapstructure:"vpin_multiplier"`    // Spread放大系数
+	VPINVolThreshold float64 `mapstructure:"vpin_vol_threshold"` // 最小成交量要求
+
+	// 分级风控配置
+	GuardBlockRatio     float64 `mapstructure:"guard_block_ratio"`     // 阶段1：禁止加仓的持仓占比
+	GuardFlattenRatio   float64 `mapstructure:"guard_flatten_ratio"`   // 阶段2：仅允许减仓的占比
+	GuardLiquidateRatio float64 `mapstructure:"guard_liquidate_ratio"` // 阶段3：触发市价清仓的占比
+	GuardPnLStopRatio   float64 `mapstructure:"guard_pnl_stop_ratio"`  // 按未实现亏损触发极限风控的比例
+	GuardCooldownSec    int     `mapstructure:"guard_cooldown_sec"`    // 每次极限风控之间的冷却秒数
+	GuardEmergencySlice float64 `mapstructure:"guard_emergency_slice"` // 极限清仓时一次性减仓占当前仓位的比例
 }
 
 var (
@@ -235,6 +243,32 @@ func validateConfig(cfg *Config) error {
 
 		// 回写到配置中（确保兼容性转换生效）
 		cfg.Symbols[i] = *sym
+		// 分级风控默认值
+		if sym.GuardBlockRatio <= 0 {
+			sym.GuardBlockRatio = 0.55
+		}
+		if sym.GuardFlattenRatio <= 0 {
+			sym.GuardFlattenRatio = 0.75
+		}
+		if sym.GuardLiquidateRatio <= 0 {
+			sym.GuardLiquidateRatio = 1.05
+		}
+		if sym.GuardPnLStopRatio <= 0 {
+			sym.GuardPnLStopRatio = 0.08
+		}
+		if sym.GuardCooldownSec <= 0 {
+			sym.GuardCooldownSec = 180
+		}
+		if sym.GuardEmergencySlice <= 0 || sym.GuardEmergencySlice > 1.0 {
+			sym.GuardEmergencySlice = 1.0
+		}
+
+		if sym.GuardFlattenRatio <= sym.GuardBlockRatio {
+			return fmt.Errorf("symbols[%d]: guard_flatten_ratio 必须 > guard_block_ratio", i)
+		}
+		if sym.GuardLiquidateRatio <= sym.GuardFlattenRatio {
+			return fmt.Errorf("symbols[%d]: guard_liquidate_ratio 必须 > guard_flatten_ratio", i)
+		}
 	}
 
 	return nil

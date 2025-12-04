@@ -31,6 +31,8 @@ type Trade struct {
 	IsBuy     bool // true=买方发起，false=卖方发起
 }
 
+const midPriceLockWarningThreshold = 200 * time.Millisecond
+
 // SymbolState 单个交易对的状态
 type SymbolState struct {
 	Mu sync.RWMutex
@@ -115,8 +117,8 @@ func (s *Store) SetActiveOrderCount(symbol string, count int) {
 	}
 
 	state.Mu.Lock()
+	defer state.Mu.Unlock()
 	state.ActiveOrderCount = count
-	state.Mu.Unlock()
 }
 
 // NewStore 创建新的存储实例
@@ -197,7 +199,15 @@ func (s *Store) UpdateMidPrice(symbol string, mid, bestBid, bestAsk float64) {
 		return
 	}
 
+	lockStart := time.Now()
 	state.Mu.Lock()
+	lockWait := time.Since(lockStart)
+	if lockWait > midPriceLockWarningThreshold {
+		log.Warn().
+			Str("symbol", symbol).
+			Dur("wait", lockWait).
+			Msg("UpdateMidPrice获取锁耗时过长，可能存在阻塞")
+	}
 	defer state.Mu.Unlock()
 
 	state.MidPrice = mid
@@ -243,9 +253,9 @@ func (s *Store) UpdatePendingOrders(symbol string, buy, sell float64) {
 	}
 
 	state.Mu.Lock()
+	defer state.Mu.Unlock()
 	state.PendingBuy = buy
 	state.PendingSell = sell
-	state.Mu.Unlock()
 }
 
 // RecordFill 记录成交
@@ -511,9 +521,9 @@ func (s *Store) EnableVPIN(symbol string, vpinCalc interface{}) {
 	}
 
 	state.Mu.Lock()
+	defer state.Mu.Unlock()
 	state.VPINEnabled = true
 	state.VPIN = vpinCalc
-	state.Mu.Unlock()
 
 	log.Info().Str("symbol", symbol).Msg("VPIN已启用")
 }
@@ -529,9 +539,9 @@ func (s *Store) DisableVPIN(symbol string) {
 	}
 
 	state.Mu.Lock()
+	defer state.Mu.Unlock()
 	state.VPINEnabled = false
 	state.VPIN = nil
-	state.Mu.Unlock()
 
 	log.Info().Str("symbol", symbol).Msg("VPIN已禁用")
 }
@@ -547,10 +557,10 @@ func (s *Store) UpdateTrade(symbol string, trade Trade) {
 		return
 	}
 
-	state.Mu.Lock()
+	state.Mu.RLock()
 	vpinEnabled := state.VPINEnabled
 	vpinCalc := state.VPIN
-	state.Mu.Unlock()
+	state.Mu.RUnlock()
 
 	// 如果VPIN已启用，更新VPIN计算器
 	if vpinEnabled && vpinCalc != nil {

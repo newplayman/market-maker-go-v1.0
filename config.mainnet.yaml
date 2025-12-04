@@ -49,10 +49,10 @@ symbols:
     
     # 磨仓模式（被动平仓）
     grinding_enabled: true                  # 启用磨仓模式
-    grinding_thresh: 0.4                    # 触发阈值 40%
+    grinding_thresh: 0.8                    # 触发阈值 80%，确保Grinding晚于钉子模式触发
     
     # 止损配置 ⚠️ 重要！
-    stop_loss_thresh: 0.03                  # 止损阈值 3%（严格止损）
+    stop_loss_thresh: 0.05                  # 止损阈值 5%，满足新风控要求
     
     # 撤单限制
     max_cancel_per_min: 50                  # 每分钟最大撤单数

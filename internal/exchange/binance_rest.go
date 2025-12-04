@@ -31,3 +31,14 @@ func (b *BinanceRESTStub) CancelOrder(symbol, orderID string) error {
 	}
 	return nil
 }
+
+// PlaceMarket 返回一个模拟的 orderID
+func (b *BinanceRESTStub) PlaceMarket(symbol, side string, qty float64, reduceOnly bool, clientID string) (string, error) {
+	if symbol == "" || side == "" || qty <= 0 {
+		return "", fmt.Errorf("invalid params")
+	}
+	if clientID == "" {
+		clientID = "cli"
+	}
+	return fmt.Sprintf("binance-%s-%s-%d", symbol, clientID, time.Now().UnixNano()), nil
+}

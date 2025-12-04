@@ -73,6 +73,8 @@ type Exchange interface {
 	CancelOrder(ctx context.Context, symbol, clientOrderID string) error
 	CancelAllOrders(ctx context.Context, symbol string) error
 	GetOpenOrders(ctx context.Context, symbol string) ([]*Order, error)
+	PlaceReduceOnlyMarket(ctx context.Context, symbol, side string, quantity float64) (string, error)
+	PlaceReduceOnlyLimit(ctx context.Context, symbol, side string, quantity, price float64) (string, error)
 
 	// Position management
 	GetPosition(ctx context.Context, symbol string) (*Position, error)

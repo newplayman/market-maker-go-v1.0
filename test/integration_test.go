@@ -67,6 +67,14 @@ func (m *MockExchange) CancelAllOrders(ctx context.Context, symbol string) error
 	return nil
 }
 
+func (m *MockExchange) PlaceReduceOnlyMarket(ctx context.Context, symbol, side string, quantity float64) (string, error) {
+	return "mock-guard-market", nil
+}
+
+func (m *MockExchange) PlaceReduceOnlyLimit(ctx context.Context, symbol, side string, quantity, price float64) (string, error) {
+	return "mock-guard-limit", nil
+}
+
 func (m *MockExchange) GetOpenOrders(ctx context.Context, symbol string) ([]*gateway.Order, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -79,6 +87,10 @@ func (m *MockExchange) GetPosition(ctx context.Context, symbol string) (*gateway
 
 func (m *MockExchange) GetAllPositions(ctx context.Context) ([]*gateway.Position, error) {
 	return nil, nil
+}
+
+func (m *MockExchange) GetAccountBalance(ctx context.Context) (float64, float64, error) {
+	return 0, 0, nil
 }
 
 func (m *MockExchange) GetFundingRate(ctx context.Context, symbol string) (*gateway.FundingRate, error) {
@@ -105,6 +117,18 @@ func (m *MockExchange) Disconnect() error {
 
 func (m *MockExchange) IsConnected() bool {
 	return true
+}
+
+func (m *MockExchange) ReconnectStreams(ctx context.Context) error {
+	return nil
+}
+
+func (m *MockExchange) SetLeverage(ctx context.Context, symbol string, leverage int) error {
+	return nil
+}
+
+func (m *MockExchange) SetMarginType(ctx context.Context, symbol string, marginType string) error {
+	return nil
 }
 
 // TestIntegration_Run 测试从启动到订单生成和同步的流程

@@ -205,6 +205,53 @@ func (b *BinanceAdapter) CancelAllOrders(ctx context.Context, symbol string) err
 	return nil
 }
 
+// PlaceReduceOnlyMarket 触发Reduce-Only市价单
+func (b *BinanceAdapter) PlaceReduceOnlyMarket(ctx context.Context, symbol, side string, quantity float64) (string, error) {
+	if quantity <= 0 {
+		return "", fmt.Errorf("quantity must be > 0")
+	}
+	if b.rest == nil {
+		return "", fmt.Errorf("rest client not initialized")
+	}
+
+	clientID := fmt.Sprintf("phoenix-guard-%s-%d", strings.ToLower(symbol), time.Now().UnixMilli())
+	if _, err := b.rest.PlaceMarket(symbol, side, quantity, true, clientID); err != nil {
+		return "", fmt.Errorf("reduce-only market order failed: %w", err)
+	}
+
+	log.Warn().
+		Str("symbol", symbol).
+		Str("side", side).
+		Float64("qty", quantity).
+		Str("client_id", clientID).
+		Msg("已提交Reduce-Only市价单")
+	return clientID, nil
+}
+
+// PlaceReduceOnlyLimit 触发Reduce-Only限价单
+func (b *BinanceAdapter) PlaceReduceOnlyLimit(ctx context.Context, symbol, side string, quantity, price float64) (string, error) {
+	if quantity <= 0 || price <= 0 {
+		return "", fmt.Errorf("invalid quantity or price")
+	}
+	if b.rest == nil {
+		return "", fmt.Errorf("rest client not initialized")
+	}
+
+	clientID := fmt.Sprintf("phoenix-guard-limit-%s-%d", strings.ToLower(symbol), time.Now().UnixMilli())
+	if _, err := b.rest.PlaceLimit(symbol, side, "GTC", price, quantity, true, false, clientID); err != nil {
+		return "", fmt.Errorf("reduce-only limit order failed: %w", err)
+	}
+
+	log.Warn().
+		Str("symbol", symbol).
+		Str("side", side).
+		Float64("qty", quantity).
+		Float64("price", price).
+		Str("client_id", clientID).
+		Msg("已提交Reduce-Only限价单")
+	return clientID, nil
+}
+
 // GetOpenOrders returns all open orders for a symbol from exchange REST API
 func (b *BinanceAdapter) GetOpenOrders(ctx context.Context, symbol string) ([]*Order, error) {
 	// 优先使用REST API获取真实的交易所订单列表

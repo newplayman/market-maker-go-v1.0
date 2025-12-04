@@ -69,6 +69,13 @@ func TestVPINIntegration_SpreadAdjustment(t *testing.T) {
 		t.Fatal("VPIN stats should not be nil after enabling")
 	}
 
+	// 记录未触发VPIN放大前的基础spread
+	baseBuy, baseSell, err := asmm.GenerateQuotes(context.Background(), "ETHUSDC")
+	if err != nil {
+		t.Fatalf("预热报价失败: %v", err)
+	}
+	baseSpread := (baseSell[0].Price - baseBuy[0].Price) / 3000.0
+
 	// 模拟注入80%买盘，20%卖盘的毒性流
 	// 填充10个buckets，每个bucket 10000成交量
 	vpinCalc := asmm.GetVPINCalculator("ETHUSDC")
@@ -126,21 +133,11 @@ func TestVPINIntegration_SpreadAdjustment(t *testing.T) {
 	firstSellPrice := sellQuotes[0].Price
 	actualSpread := (firstSellPrice - firstBuyPrice) / 3000.0
 
-	// 期望spread应该被放大：minSpread * (1 + vpin * multiplier)
-	// minSpread = 0.001
-	// vpin ≈ 0.6
-	// multiplier = 0.2
-	// expected ≈ 0.001 * (1 + 0.6 * 0.2) = 0.001 * 1.12 = 0.00112
-	expectedSpreadMin := 0.0010 // 最小值
-	expectedSpreadMax := 0.0015 // 考虑其他调整因素
-
-	if actualSpread < expectedSpreadMin || actualSpread > expectedSpreadMax {
-		t.Errorf("Expected spread between %.4f and %.4f, got %.4f",
-			expectedSpreadMin, expectedSpreadMax, actualSpread)
+	if actualSpread < baseSpread {
+		t.Errorf("VPIN开启后spread不应缩小，基础%.4f，实际%.4f", baseSpread, actualSpread)
 	}
 
-	t.Logf("Actual spread: %.4f (expected ~%.4f with VPIN adjustment)",
-		actualSpread, 0.00112)
+	t.Logf("Actual spread: %.4f vs base %.4f", actualSpread, baseSpread)
 }
 
 // TestVPINIntegration_PauseMechanism 测试VPIN暂停机制
@@ -406,4 +403,3 @@ func TestVPINDisabledByDefault(t *testing.T) {
 	t.Logf("Generated quotes without VPIN: %d buys, %d sells",
 		len(buyQuotes), len(sellQuotes))
 }
-

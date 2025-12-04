@@ -31,21 +31,21 @@ global:
 symbols:
 
   # ==============================================
-  # 1. ETHUSDC (~30U/单, ~800U netMax)
+  # 1. ETHUSDC (~28U/单, ~800U netMax)
   # ==============================================
   - symbol: "ETHUSDC"
     net_max: 0.26                           # 0.26 ETH @3050 ≈ 790U
-    min_spread: 0.0012
+    min_spread: 0.0005
     tick_size: 0.01
     min_qty: 0.001
     
     total_layers: 7
-    unified_layer_size: 0.01                # ≈30U/单
-    grid_start_offset: 1.85
-    grid_first_spacing: 1.6
-    grid_spacing_multiplier: 1.25
-    grid_max_spacing: 35.0
-    
+    unified_layer_size: 0.0085              # ≈26U/单，降低单笔敞口
+    grid_start_offset: 1.5                  # 1.5U @ 3100 (0.05%)
+    grid_first_spacing: 1.5                 # 1.5U
+    grid_spacing_multiplier: 1.75           # 几何增长，第6-7层间距约25U
+    grid_max_spacing: 50.0
+
     pinning_enabled: true
     pinning_thresh: 0.5
     grinding_enabled: true
@@ -53,23 +53,40 @@ symbols:
     stop_loss_thresh: 0.05
     max_cancel_per_min: 40
     inventory_skew_coeff: 0.006
-    vol_smoothing_alpha: 0.02
+    vol_smoothing_alpha: 0.05
+    
+    # VPIN配置
+    vpin_enabled: true
+    vpin_bucket_size: 50000
+    vpin_num_buckets: 50
+    vpin_threshold: 0.7
+    vpin_pause_thresh: 0.9
+    vpin_multiplier: 0.2
+    vpin_vol_threshold: 100000
+    
+    # 多级风控
+    guard_block_ratio: 0.6                  # 仓位>=60%时停止加仓
+    guard_flatten_ratio: 0.8                # 仓位>=80%仅允许减仓+磨成本
+    guard_liquidate_ratio: 1.1              # 仓位>110%触发市价清仓
+    guard_pnl_stop_ratio: 0.09              # 未实现亏损超9%触发极限动作
+    guard_cooldown_sec: 240                 # 极限动作冷却时间
+    guard_emergency_slice: 0.7              # 每次极限动作平掉70%仓位
 
   # ==============================================
   # 2. SOLUSDC (~28U/单, ~800U netMax)
   # ==============================================
   - symbol: "SOLUSDC"
     net_max: 5.5                            # 5.5 SOL @142 ≈ 780U
-    min_spread: 0.0011
+    min_spread: 0.0008
     tick_size: 0.01
     min_qty: 0.1
     
     total_layers: 7
     unified_layer_size: 0.2                 # ≈28U/单
-    grid_start_offset: 0.13
-    grid_first_spacing: 0.13
-    grid_spacing_multiplier: 1.25
-    grid_max_spacing: 3.0
+    grid_start_offset: 0.07                 # 0.07U @ 140 (0.05%)
+    grid_first_spacing: 0.07                # 0.07U
+    grid_spacing_multiplier: 1.75           # 尾部间距约 1.2U
+    grid_max_spacing: 5.0
     
     pinning_enabled: true
     pinning_thresh: 0.5
@@ -78,23 +95,32 @@ symbols:
     stop_loss_thresh: 0.05
     max_cancel_per_min: 40
     inventory_skew_coeff: 0.005
-    vol_smoothing_alpha: 0.02
+    vol_smoothing_alpha: 0.05
+    
+    # VPIN配置
+    vpin_enabled: true
+    vpin_bucket_size: 30000
+    vpin_num_buckets: 50
+    vpin_threshold: 0.7
+    vpin_pause_thresh: 0.9
+    vpin_multiplier: 0.2
+    vpin_vol_threshold: 60000
 
   # ==============================================
   # 3. BNBUSDC (~31U/单, ~800U netMax)
   # ==============================================
   - symbol: "BNBUSDC"
     net_max: 0.9                            # 0.9 BNB @895 ≈ 805U
-    min_spread: 0.00085
+    min_spread: 0.0003
     tick_size: 0.1
     min_qty: 0.01
     
     total_layers: 7
     unified_layer_size: 0.04                # ≈36U/单 (满足0.01步进)
-    grid_start_offset: 0.43
-    grid_first_spacing: 0.34
-    grid_spacing_multiplier: 1.25
-    grid_max_spacing: 12.0
+    grid_start_offset: 0.45                 # 0.45U @ 900 (0.05%)
+    grid_first_spacing: 0.45                # 0.45U
+    grid_spacing_multiplier: 1.75           # 尾部间距约 7.5U
+    grid_max_spacing: 20.0
     
     pinning_enabled: true
     pinning_thresh: 0.5
@@ -103,23 +129,32 @@ symbols:
     stop_loss_thresh: 0.05
     max_cancel_per_min: 40
     inventory_skew_coeff: 0.005
-    vol_smoothing_alpha: 0.02
+    vol_smoothing_alpha: 0.05
+    
+    # VPIN配置
+    vpin_enabled: true
+    vpin_bucket_size: 20000
+    vpin_num_buckets: 50
+    vpin_threshold: 0.7
+    vpin_pause_thresh: 0.9
+    vpin_multiplier: 0.2
+    vpin_vol_threshold: 40000
 
   # ==============================================
   # 4. XRPUSDC (~26U/单, ~800U netMax)
   # ==============================================
   - symbol: "XRPUSDC"
     net_max: 360.0                          # 360 XRP @2.2 ≈ 792U
-    min_spread: 0.0011
+    min_spread: 0.0005
     tick_size: 0.0001
     min_qty: 1.0
     
     total_layers: 7
     unified_layer_size: 12.0                # ≈26U/单
-    grid_start_offset: 0.0020
-    grid_first_spacing: 0.0016
-    grid_spacing_multiplier: 1.25
-    grid_max_spacing: 0.07
+    grid_start_offset: 0.0011               # 0.0011U @ 2.2 (0.05%)
+    grid_first_spacing: 0.0011              # 0.0011U
+    grid_spacing_multiplier: 1.75           # 尾部间距约 0.018U
+    grid_max_spacing: 0.1
     
     pinning_enabled: true
     pinning_thresh: 0.5
@@ -128,23 +163,32 @@ symbols:
     stop_loss_thresh: 0.05
     max_cancel_per_min: 40
     inventory_skew_coeff: 0.004
-    vol_smoothing_alpha: 0.02
+    vol_smoothing_alpha: 0.05
+    
+    # VPIN配置
+    vpin_enabled: true
+    vpin_bucket_size: 100000
+    vpin_num_buckets: 50
+    vpin_threshold: 0.7
+    vpin_pause_thresh: 0.9
+    vpin_multiplier: 0.2
+    vpin_vol_threshold: 200000
 
   # ==============================================
   # 5. DOGEUSDC (~30U/单, ~800U netMax)
   # ==============================================
   - symbol: "DOGEUSDC"
     net_max: 5200.0                         # 5200 DOGE @0.15 ≈ 780U
-    min_spread: 0.0014
+    min_spread: 0.0009
     tick_size: 0.00001
     min_qty: 10.0
     
     total_layers: 7
     unified_layer_size: 200.0               # ≈30U/单
-    grid_start_offset: 0.00022
-    grid_first_spacing: 0.00018
-    grid_spacing_multiplier: 1.25
-    grid_max_spacing: 0.012
+    grid_start_offset: 0.00008              # 0.00008U @ 0.156 (0.05%)
+    grid_first_spacing: 0.00008             # 0.00008U
+    grid_spacing_multiplier: 1.75           # 尾部间距约 0.0013U
+    grid_max_spacing: 0.02
     
     pinning_enabled: true
     pinning_thresh: 0.5
@@ -153,4 +197,13 @@ symbols:
     stop_loss_thresh: 0.05
     max_cancel_per_min: 40
     inventory_skew_coeff: 0.003
-    vol_smoothing_alpha: 0.02
+    vol_smoothing_alpha: 0.05
+    
+    # VPIN配置
+    vpin_enabled: true
+    vpin_bucket_size: 200000
+    vpin_num_buckets: 50
+    vpin_threshold: 0.7
+    vpin_pause_thresh: 0.9
+    vpin_multiplier: 0.2
+    vpin_vol_threshold: 400000

@@ -14,4 +14,7 @@ func TestBinanceRESTStubPlaceCancel(t *testing.T) {
 	if err := cli.CancelOrder("BTCUSDT", id); err != nil {
 		t.Fatalf("cancel error: %v", err)
 	}
+	if mid, err := cli.PlaceMarket("BTCUSDT", "SELL", 2, true, "cid2"); err != nil || mid == "" {
+		t.Fatalf("place market error: %v id=%s", err, mid)
+	}
 }

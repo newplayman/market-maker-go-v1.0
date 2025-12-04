@@ -12,20 +12,32 @@ import (
 
 // runDepthProcessor 【P1-1】处理深度消息的独立goroutine
 // 从channel中取出消息处理,解耦WebSocket接收和业务处理,防止背压
-func (r *Runner) runDepthProcessor(ctx context.Context) {
+func (r *Runner) runDepthProcessor(ctx context.Context, workerID int) {
 	defer r.wg.Done()
 
-	log.Info().Msg("【P1-1】深度消息处理器已启动")
+	log.Info().
+		Int("worker_id", workerID).
+		Msg("【P1-1】深度消息处理器已启动")
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info().Msg("深度处理器收到退出信号")
+			log.Info().
+				Int("worker_id", workerID).
+				Msg("深度处理器收到退出信号(ctx)")
 			return
 		case <-r.stopChan:
-			log.Info().Msg("深度处理器收到停止信号")
+			log.Info().
+				Int("worker_id", workerID).
+				Msg("深度处理器收到停止信号")
 			return
-		case depth := <-r.depthChan:
+		case depth, ok := <-r.depthChan:
+			if !ok {
+				log.Info().
+					Int("worker_id", workerID).
+					Msg("深度处理器检测到通道关闭，退出")
+				return
+			}
 			// 【紧急修复】主动丢弃堆积的旧消息
 			// 如果channel中还有很多消息,说明处理跟不上,丢弃旧的只保留最新
 			channelLen := len(r.depthChan)
@@ -39,6 +51,7 @@ func (r *Runner) runDepthProcessor(ctx context.Context) {
 				if droppedCount > 0 {
 					atomic.AddInt64(&r.depthDropCount, int64(droppedCount))
 					log.Warn().
+						Int("worker_id", workerID).
 						Int("dropped", droppedCount).
 						Int("remaining", len(r.depthChan)).
 						Msg("【紧急修复】主动丢弃堆积的旧深度消息")

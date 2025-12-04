@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -61,6 +62,14 @@ func (m *MockExchange) CancelAllOrders(ctx context.Context, symbol string) error
 	return nil
 }
 
+func (m *MockExchange) PlaceReduceOnlyMarket(ctx context.Context, symbol, side string, quantity float64) (string, error) {
+	return "mock-guard-market", nil
+}
+
+func (m *MockExchange) PlaceReduceOnlyLimit(ctx context.Context, symbol, side string, quantity, price float64) (string, error) {
+	return "mock-guard-limit", nil
+}
+
 func (m *MockExchange) GetOpenOrders(ctx context.Context, symbol string) ([]*gateway.Order, error) {
 	return nil, nil
 }
@@ -78,6 +87,10 @@ func (m *MockExchange) GetPosition(ctx context.Context, symbol string) (*gateway
 
 func (m *MockExchange) GetAllPositions(ctx context.Context) ([]*gateway.Position, error) {
 	return nil, nil
+}
+
+func (m *MockExchange) GetAccountBalance(ctx context.Context) (float64, float64, error) {
+	return 0, 0, nil
 }
 
 func (m *MockExchange) GetFundingRate(ctx context.Context, symbol string) (*gateway.FundingRate, error) {
@@ -102,6 +115,18 @@ func (m *MockExchange) Disconnect() error {
 
 func (m *MockExchange) IsConnected() bool {
 	return true
+}
+
+func (m *MockExchange) ReconnectStreams(ctx context.Context) error {
+	return nil
+}
+
+func (m *MockExchange) SetLeverage(ctx context.Context, symbol string, leverage int) error {
+	return nil
+}
+
+func (m *MockExchange) SetMarginType(ctx context.Context, symbol string, marginType string) error {
+	return nil
 }
 
 func TestRunner_Initialization(t *testing.T) {
@@ -358,5 +383,46 @@ func TestRunner_MultiSymbol(t *testing.T) {
 	// 验证两个交易对都有订单
 	if mockExch.placeOrderCalled < 4 {
 		t.Errorf("Expected at least 4 PlaceOrder calls for 2 symbols, got %d", mockExch.placeOrderCalled)
+	}
+}
+
+func TestRunnerEnforceQuotePrecision(t *testing.T) {
+	cfg := &config.Config{
+		Symbols: []config.SymbolConfig{
+			{
+				Symbol:   "ETHUSDC",
+				MinQty:   0.01,
+				TickSize: 0.05,
+			},
+		},
+	}
+	st := store.NewStore("", time.Minute)
+	st.InitSymbol("ETHUSDC", 10)
+
+	mockExch := NewMockExchange()
+	strat := strategy.NewASMM(cfg, st)
+	riskMgr := risk.NewRiskManager(cfg, st)
+	runner := NewRunner(cfg, st, strat, riskMgr, mockExch)
+
+	quotes := []strategy.Quote{
+		{Price: 3125.12345, Size: 0.0085, Layer: 1},
+		{Price: 3125.076, Size: 0.0199, Layer: 2},
+		{Price: 0, Size: 0.0004, Layer: 3},
+	}
+
+	sanitized := runner.enforceQuotePrecision("ETHUSDC", quotes, &cfg.Symbols[0], "BUY")
+	if len(sanitized) != 2 {
+		t.Fatalf("expected 2 sanitized quotes, got %d", len(sanitized))
+	}
+
+	if math.Abs(sanitized[0].Size-0.01) > 1e-9 {
+		t.Fatalf("expected first quote size rounded to 0.01, got %.5f", sanitized[0].Size)
+	}
+	if math.Abs(sanitized[1].Size-0.02) > 1e-9 {
+		t.Fatalf("expected second quote size rounded to 0.02, got %.5f", sanitized[1].Size)
+	}
+
+	if math.Abs(sanitized[0].Price-3125.1) > 1e-9 {
+		t.Fatalf("expected price rounded to 3125.10, got %.5f", sanitized[0].Price)
 	}
 }

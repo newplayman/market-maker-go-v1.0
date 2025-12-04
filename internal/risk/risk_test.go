@@ -39,7 +39,7 @@ func TestCheckBatchPreTrade_LightPositionPrinciple(t *testing.T) {
 	rm := NewRiskManager(cfg, st)
 
 	// 测试场景1：空仓时，双边各挂0.072 ETH（0.006*12层=0.072）
-	// 最坏情况：0.072 ETH < 0.075 ETH (50% NetMax)，应该通过
+	// 最坏情况：0.072 ETH < 0.225 ETH (150% NetMax)，应该通过
 	buyQuotes := make([]Quote, 12)
 	sellQuotes := make([]Quote, 12)
 	for i := 0; i < 12; i++ {
@@ -53,7 +53,7 @@ func TestCheckBatchPreTrade_LightPositionPrinciple(t *testing.T) {
 	}
 
 	// 测试场景2：空仓时，双边各挂0.24 ETH（原配置：0.01*24层=0.24）
-	// 最坏情况：0.24 ETH > 0.075 ETH (50% NetMax)，应该失败
+	// 最坏情况：0.24 ETH > 0.225 ETH (150% NetMax)，应该失败
 	buyQuotes24 := make([]Quote, 24)
 	sellQuotes24 := make([]Quote, 24)
 	for i := 0; i < 24; i++ {
@@ -66,21 +66,30 @@ func TestCheckBatchPreTrade_LightPositionPrinciple(t *testing.T) {
 		t.Errorf("空仓时24层大挂单应该失败，但通过了")
 	}
 
-	// 测试场景3：已有0.05 ETH多头仓位，再挂0.05 ETH买单
-	// 最坏情况：0.05 + 0.05 = 0.10 ETH > 0.075 ETH，应该失败
+	// 测试场景3：已有0.05 ETH多头仓位，再挂0.20 ETH买单
+	// 最坏情况：0.05 + 0.20 = 0.25 ETH > 0.225 ETH，应该失败
 	pos.Size = 0.05
 	st.UpdatePosition("ETHUSDC", pos)
 
-	buyQuotesSmall := []Quote{
-		{Price: 2990.0, Size: 0.05, Layer: 1},
+	buyQuotesLarge := []Quote{
+		{Price: 2990.0, Size: 0.2, Layer: 1},
 	}
 	sellQuotesSmall := []Quote{
 		{Price: 3010.0, Size: 0.01, Layer: 1},
 	}
 
-	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotesSmall, sellQuotesSmall)
+	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotesLarge, sellQuotesSmall)
 	if err == nil {
-		t.Errorf("多头仓位时再挂大买单应该失败，但通过了")
+		t.Errorf("多头仓位时再挂超量买单应该失败，但通过了")
+	}
+
+	// 验证较小的买单仍然允许
+	buyQuotesSmall := []Quote{
+		{Price: 2990.0, Size: 0.02, Layer: 1},
+	}
+	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotesSmall, sellQuotesSmall)
+	if err != nil {
+		t.Errorf("多头仓位时挂少量买单应该通过，但失败: %v", err)
 	}
 
 	// 测试场景4：已有0.05 ETH多头仓位，挂0.05 ETH卖单（减仓方向）
@@ -95,21 +104,20 @@ func TestCheckBatchPreTrade_LightPositionPrinciple(t *testing.T) {
 		t.Errorf("多头仓位时挂卖单（减仓）应该通过，但失败: %v", err)
 	}
 
-	// 测试场景5：已有0.08 ETH多头仓位，接近满仓（53% NetMax）
-	// 再挂任何买单都应该失败
-	pos.Size = 0.08
+	// 测试场景5：已有0.15 ETH多头仓位，已经触发Grinding
+	pos.Size = 0.15
 	st.UpdatePosition("ETHUSDC", pos)
 
-	buyQuotesTiny := []Quote{
-		{Price: 2990.0, Size: 0.01, Layer: 1},
+	buyQuotesTooBig := []Quote{
+		{Price: 2990.0, Size: 0.1, Layer: 1},
 	}
 	sellQuotesTiny := []Quote{
 		{Price: 3010.0, Size: 0.01, Layer: 1},
 	}
 
-	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotesTiny, sellQuotesTiny)
+	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotesTooBig, sellQuotesTiny)
 	if err == nil {
-		t.Errorf("接近满仓时挂买单应该失败，但通过了")
+		t.Errorf("高仓位时再挂买单应该失败，但通过了")
 	}
 }
 
@@ -143,9 +151,9 @@ func TestCheckBatchPreTrade_AsymmetricPositions(t *testing.T) {
 	// 允许挂更多卖单：0.06 (当前) + 0.075 (50% NetMax) = 0.135 ETH卖单容量
 	// 但买单容量受限：0.075 - 0.06 = 0.015 ETH
 
-	// 测试：挂0.02 ETH买单应该失败
+	// 测试：挂0.20 ETH买单应该失败
 	buyQuotesOver := []Quote{
-		{Price: 2990.0, Size: 0.02, Layer: 1},
+		{Price: 2990.0, Size: 0.2, Layer: 1},
 	}
 	sellQuotesNormal := []Quote{
 		{Price: 3010.0, Size: 0.02, Layer: 1},
@@ -202,9 +210,10 @@ func TestCheckBatchPreTrade_EdgeCases(t *testing.T) {
 		t.Errorf("空报价列表应该通过，但失败: %v", err)
 	}
 
-	// 测试：刚好等于50% NetMax应该通过
+	// 测试：刚好等于150% NetMax应该通过（考虑浮点误差留出极小余量）
+	exactSize := cfg.Symbols[0].NetMax*1.5 - 1e-6
 	buyQuotesExact := []Quote{
-		{Price: 2990.0, Size: 0.075, Layer: 1},
+		{Price: 2990.0, Size: exactSize, Layer: 1},
 	}
 
 	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotesExact, []Quote{})
@@ -212,9 +221,10 @@ func TestCheckBatchPreTrade_EdgeCases(t *testing.T) {
 		t.Errorf("刚好等于50%% NetMax应该通过，但失败: %v", err)
 	}
 
-	// 测试：超过50% NetMax一点应该失败
+	// 测试：超过150% NetMax一点应该失败
+	overSize := cfg.Symbols[0].NetMax*1.5 + 0.01
 	buyQuotesOver := []Quote{
-		{Price: 2990.0, Size: 0.076, Layer: 1},
+		{Price: 2990.0, Size: overSize, Layer: 1},
 	}
 
 	err = rm.CheckBatchPreTrade("ETHUSDC", buyQuotesOver, []Quote{})

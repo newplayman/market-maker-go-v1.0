@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,6 +51,19 @@ type Runner struct {
 	safeModeMu     sync.RWMutex
 	safeMode       bool
 	safeModeReason string
+
+	// 极限风控
+	emergencyMu         sync.Mutex
+	lastEmergencyAction map[string]time.Time
+	emergencyOrders     map[string]*emergencyOrder
+}
+
+type emergencyOrder struct {
+	Symbol    string
+	Side      string
+	Quantity  float64
+	OrderType string
+	CreatedAt time.Time
 }
 
 // NewRunner 创建Runner实例
@@ -62,13 +76,15 @@ func NewRunner(
 ) *Runner {
 	om := order.NewOrderManager(st, exch)
 	return &Runner{
-		cfg:      cfg,
-		store:    st,
-		strategy: strat,
-		risk:     riskMgr,
-		exchange: exch,
-		om:       om,
-		stopChan: make(chan struct{}),
+		cfg:                 cfg,
+		store:               st,
+		strategy:            strat,
+		risk:                riskMgr,
+		exchange:            exch,
+		om:                  om,
+		stopChan:            make(chan struct{}),
+		lastEmergencyAction: make(map[string]time.Time),
+		emergencyOrders:     make(map[string]*emergencyOrder),
 	}
 }
 
@@ -80,6 +96,20 @@ func (r *Runner) Start(ctx context.Context) error {
 		return fmt.Errorf("runner已停止，无法重新启动")
 	}
 	r.mu.Unlock()
+
+	// 提前初始化深度通道，避免WebSocket开始推送时channel尚未就绪
+	if r.depthChan == nil {
+		r.depthChan = make(chan *gateway.Depth, DEPTH_CHANNEL_BUFFER_SIZE)
+		log.Info().
+			Int("channel_cap", DEPTH_CHANNEL_BUFFER_SIZE).
+			Int("workers", DEPTH_PROCESSOR_WORKERS).
+			Msg("初始化深度消息处理管线")
+
+		for workerID := 1; workerID <= DEPTH_PROCESSOR_WORKERS; workerID++ {
+			r.wg.Add(1)
+			go r.runDepthProcessor(ctx, workerID)
+		}
+	}
 
 	// 连接交易所
 	log.Info().Msg("正在连接交易所...")
@@ -134,11 +164,6 @@ func (r *Runner) Start(ctx context.Context) error {
 		r.wg.Add(1)
 		go r.runSymbol(ctx, symCfg.Symbol)
 	}
-
-	// 【P1-1】启动深度消息处理goroutine(解耦接收和处理)
-	r.depthChan = make(chan *gateway.Depth, DEPTH_CHANNEL_BUFFER_SIZE)
-	r.wg.Add(1)
-	go r.runDepthProcessor(ctx)
 
 	// 启动全局监控协程
 	r.wg.Add(1)
@@ -300,15 +325,25 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 
 		// 【修复断流】将检测阈值从3秒降低到2秒，更快检测断流
 		if lastUpdate.IsZero() || time.Since(lastUpdate) > STALE_PRICE_THRESHOLD_SECONDS*time.Second {
+			staleDuration := time.Since(lastUpdate)
 			log.Error().
 				Str("symbol", symbol).
 				Time("last_update", lastUpdate).
-				Dur("stale_duration", time.Since(lastUpdate)).
+				Dur("stale_duration", staleDuration).
 				Float64("mid", midPrice).
 				Msg("【告警】价格数据过期，停止报价！WebSocket可能断流")
 
 			// 记录错误到metrics
 			metrics.RecordError("stale_price_data", symbol)
+
+			if drained := r.drainDepthChannel("stale_price"); drained > 0 {
+				log.Warn().
+					Str("symbol", symbol).
+					Int("drained", drained).
+					Msg("检测到价格过期，已主动丢弃堆积的深度消息")
+			}
+
+			r.refreshMidPriceFromREST(ctx, symbol)
 
 			// 【修复断流】检测到断流时立即触发重连（不等待global monitor）
 			r.tryReconnectWebSocket()
@@ -365,6 +400,7 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 	if err != nil {
 		return fmt.Errorf("生成报价失败: %w", err)
 	}
+	metrics.UpdateGridLayerMetrics(symbol, len(buyQuotes), len(sellQuotes))
 
 	// 【新增】生成报价后，记录详细网格信息
 	if len(buyQuotes) > 0 && len(sellQuotes) > 0 {
@@ -437,7 +473,19 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 			Msg("报价已生成（统一几何网格）")
 	}
 
-	// 5. 批量风控检查（新增）- 确保轻仓做市原则
+	// 5. 根据持仓分级风控调整网格
+	buyQuotes, sellQuotes, guardHalt := r.applyPositionGuards(ctx, symbol, buyQuotes, sellQuotes)
+	if guardHalt {
+		log.Warn().
+			Str("symbol", symbol).
+			Msg("极限风控动作进行中，本轮跳过下单循环")
+		return nil
+	}
+
+	buyQuotes = r.enforceQuotePrecision(symbol, buyQuotes, symCfg, "BUY")
+	sellQuotes = r.enforceQuotePrecision(symbol, sellQuotes, symCfg, "SELL")
+
+	// 6. 批量风控检查（新增）- 确保轻仓做市原则
 	// 检查所有挂单累计风险，防止满仓
 	buyRiskQuotes := make([]risk.Quote, len(buyQuotes))
 	for i, q := range buyQuotes {
@@ -458,6 +506,8 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 
 		// 根据风控结果调整报价数量/大小
 		buyQuotes, sellQuotes = r.adjustQuotesForRisk(symbol, buyQuotes, sellQuotes)
+		buyQuotes = r.enforceQuotePrecision(symbol, buyQuotes, symCfg, "BUY")
+		sellQuotes = r.enforceQuotePrecision(symbol, sellQuotes, symCfg, "SELL")
 
 		log.Info().
 			Str("symbol", symbol).
@@ -466,14 +516,14 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 			Msg("报价已根据风控要求调整")
 	}
 
-	// 6. 验证报价
+	// 7. 验证报价
 	if len(buyQuotes) > 0 && len(sellQuotes) > 0 {
 		if err := r.risk.ValidateQuotes(symbol, buyQuotes[0].Price, sellQuotes[0].Price); err != nil {
 			return fmt.Errorf("报价验证失败: %w", err)
 		}
 	}
 
-	// 7. 转换为exchange.Order并进行Pre-Trade风控校验
+	// 8. 转换为exchange.Order并进行Pre-Trade风控校验
 	desiredBuyOrders := make([]*gateway.Order, 0, len(buyQuotes))
 	for _, quote := range buyQuotes {
 		// Pre-Trade风控检查：每个买单都需要通过风控校验
@@ -516,10 +566,10 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 		})
 	}
 
-	// 8. 同步当前本地订单状态（已移至函数开头）
+	// 9. 同步当前本地订单状态（已移至函数开头）
 	// if err := r.om.SyncActiveOrders(ctx, symbol); err != nil { ... }
 
-	// 9. 计算订单差分，获取待撤销和待新增订单
+	// 10. 计算订单差分，获取待撤销和待新增订单
 	symCfg = r.cfg.GetSymbolConfig(symbol)
 
 	// 计算防闪烁容差 (Anti-Flicker Tolerance)
@@ -571,7 +621,7 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 
 	toCancel, toPlace := r.om.CalculateOrderDiff(symbol, desiredBuyOrders, desiredSellOrders, tolerance)
 
-	// 10. 应用差分，执行撤单和新单下单
+	// 11. 应用差分，执行撤单和新单下单
 	if r.dryRun {
 		log.Info().
 			Str("symbol", symbol).
@@ -597,7 +647,7 @@ func (r *Runner) processSymbol(ctx context.Context, symbol string) error {
 		Int("sell_quotes", len(sellQuotes)).
 		Msg("报价已下达")
 
-	// 10. 更新指标
+	// 12. 更新指标
 	r.updateSymbolMetrics(symbol)
 
 	return nil
@@ -709,6 +759,411 @@ func (r *Runner) adjustQuotesForRisk(symbol string, buyQuotes, sellQuotes []stra
 	return adjustedBuyQuotes, adjustedSellQuotes
 }
 
+// applyPositionGuards 根据持仓/浮亏触发多级风控
+func (r *Runner) applyPositionGuards(ctx context.Context, symbol string, buyQuotes, sellQuotes []strategy.Quote) ([]strategy.Quote, []strategy.Quote, bool) {
+	symCfg := r.cfg.GetSymbolConfig(symbol)
+	if symCfg == nil {
+		return buyQuotes, sellQuotes, false
+	}
+
+	guardBlock := symCfg.GuardBlockRatio
+	if guardBlock <= 0 {
+		guardBlock = 0.55
+	}
+	guardFlatten := symCfg.GuardFlattenRatio
+	if guardFlatten <= guardBlock {
+		guardFlatten = guardBlock + 0.2
+	}
+	guardLiquidate := symCfg.GuardLiquidateRatio
+	if guardLiquidate <= guardFlatten {
+		guardLiquidate = guardFlatten + 0.2
+	}
+	guardPnLStop := symCfg.GuardPnLStopRatio
+	if guardPnLStop <= 0 {
+		guardPnLStop = 0.08
+	}
+	cooldownSec := symCfg.GuardCooldownSec
+	if cooldownSec <= 0 {
+		cooldownSec = 180
+	}
+	emergencySlice := symCfg.GuardEmergencySlice
+	if emergencySlice <= 0 || emergencySlice > 1 {
+		emergencySlice = 1
+	}
+
+	state := r.store.GetSymbolState(symbol)
+	if state == nil {
+		return buyQuotes, sellQuotes, false
+	}
+
+	state.Mu.RLock()
+	pos := state.Position.Size
+	unrealized := state.Position.UnrealizedPNL
+	notional := state.Position.Notional
+	state.Mu.RUnlock()
+
+	if pos == 0 {
+		return buyQuotes, sellQuotes, false
+	}
+
+	posRatio := math.Abs(pos) / symCfg.NetMax
+	drawdownRatio := 0.0
+	if notional > 0 {
+		drawdownRatio = math.Abs(unrealized) / notional
+	}
+
+	addSide := &buyQuotes
+	reduceSide := &sellQuotes
+	direction := "LONG"
+	if pos < 0 {
+		addSide = &sellQuotes
+		reduceSide = &buyQuotes
+		direction = "SHORT"
+	}
+
+	// 阶段1：关闭加仓挂单
+	if posRatio >= guardBlock {
+		if len(*addSide) > 0 {
+			log.Warn().
+				Str("symbol", symbol).
+				Str("direction", direction).
+				Float64("pos_ratio", posRatio).
+				Msg("风控阶段1触发：同向挂单全部取消，禁止继续加仓")
+		}
+		*addSide = nil
+	}
+
+	// 阶段2：仅保留磨成本挂单
+	if posRatio >= guardFlatten {
+		focused := r.focusReduceQuotes(*reduceSide, symCfg.MinQty)
+		if len(focused) > 0 {
+			log.Warn().
+				Str("symbol", symbol).
+				Str("direction", direction).
+				Float64("pos_ratio", posRatio).
+				Int("layers", len(focused)).
+				Msg("风控阶段2触发：仅保留磨成本减仓挂单")
+		}
+		*reduceSide = focused
+		*addSide = nil
+	}
+
+	// 阶段3：市价极限清仓
+	emergencyByPos := posRatio >= guardLiquidate
+	emergencyByPNL := unrealized < 0 && drawdownRatio >= guardPnLStop
+	if emergencyByPos || emergencyByPNL {
+		reason := "pos_ratio"
+		if emergencyByPNL {
+			reason = "drawdown"
+		}
+		cooldown := time.Duration(cooldownSec) * time.Second
+		if r.isEmergencyCooling(symbol, cooldown) {
+			log.Warn().
+				Str("symbol", symbol).
+				Str("reason", reason).
+				Dur("cooldown", cooldown).
+				Msg("风控阶段3触发，但处于冷却期，等待上一笔极限单执行")
+			return buyQuotes, sellQuotes, true
+		}
+
+		qty := math.Abs(pos) * emergencySlice
+		if qty < symCfg.MinQty {
+			qty = math.Abs(pos)
+		}
+		side := "SELL"
+		if pos < 0 {
+			side = "BUY"
+		}
+
+		log.Error().
+			Str("symbol", symbol).
+			Str("reason", reason).
+			Float64("pos_ratio", posRatio).
+			Float64("drawdown_ratio", drawdownRatio).
+			Str("side", side).
+			Float64("qty", qty).
+			Msg("风控阶段3触发：提交Reduce-Only市价单")
+
+		clientID, err := r.exchange.PlaceReduceOnlyMarket(ctx, symbol, side, qty)
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("symbol", symbol).
+				Str("side", side).
+				Msg("极限清仓下单失败")
+
+			if r.shouldFallbackReduceOnly(err) {
+				if limitPrice, ok := r.getEmergencyLimitPrice(symbol, side, symCfg); ok {
+					limitClientID, errLimit := r.exchange.PlaceReduceOnlyLimit(ctx, symbol, side, qty, limitPrice)
+					if errLimit != nil {
+						log.Error().
+							Err(errLimit).
+							Str("symbol", symbol).
+							Str("side", side).
+							Float64("price", limitPrice).
+							Msg("极限清仓限价单也失败")
+					} else {
+						r.trackEmergencyOrder(symbol, limitClientID, side, qty, "limit")
+						r.markEmergency(symbol)
+						log.Warn().
+							Str("symbol", symbol).
+							Str("side", side).
+							Float64("qty", qty).
+							Float64("price", limitPrice).
+							Msg("极限清仓通过限价单提交，进入冷却期")
+						return buyQuotes, sellQuotes, true
+					}
+				} else {
+					log.Error().
+						Str("symbol", symbol).
+						Msg("无法获取盘口价格，极限清仓限价单未执行")
+				}
+			}
+		} else {
+			r.trackEmergencyOrder(symbol, clientID, side, qty, "market")
+			r.markEmergency(symbol)
+			log.Warn().
+				Str("symbol", symbol).
+				Str("side", side).
+				Float64("qty", qty).
+				Msg("极限清仓下单成功，进入冷却期")
+		}
+		return buyQuotes, sellQuotes, true
+	}
+
+	return buyQuotes, sellQuotes, false
+}
+
+func (r *Runner) focusReduceQuotes(quotes []strategy.Quote, minQty float64) []strategy.Quote {
+	if len(quotes) == 0 {
+		return quotes
+	}
+
+	maxLayers := 2
+	if len(quotes) < maxLayers {
+		maxLayers = len(quotes)
+	}
+
+	focused := make([]strategy.Quote, 0, maxLayers)
+	for i := 0; i < maxLayers; i++ {
+		q := quotes[i]
+		boosted := q.Size * 1.5
+		if boosted < minQty {
+			boosted = math.Max(minQty, q.Size)
+		}
+		q.Size = boosted
+		focused = append(focused, q)
+	}
+	return focused
+}
+
+// enforceQuotePrecision 将报价数量/价格对齐到交易所要求的步长，避免精度错误导致下单失败
+func (r *Runner) enforceQuotePrecision(symbol string, quotes []strategy.Quote, symCfg *config.SymbolConfig, side string) []strategy.Quote {
+	if len(quotes) == 0 || symCfg == nil {
+		return quotes
+	}
+
+	minQty := symCfg.MinQty
+	tick := symCfg.TickSize
+
+	filtered := make([]strategy.Quote, 0, len(quotes))
+	removed := 0
+
+	for _, q := range quotes {
+		if minQty > 0 {
+			q.Size = roundToStep(q.Size, minQty)
+		}
+		if q.Size < minQty || q.Size <= 0 {
+			removed++
+			continue
+		}
+
+		if tick > 0 {
+			q.Price = roundToStep(q.Price, tick)
+		}
+		if q.Price <= 0 {
+			removed++
+			continue
+		}
+
+		filtered = append(filtered, q)
+	}
+
+	if removed > 0 {
+		log.Warn().
+			Str("symbol", symbol).
+			Str("side", side).
+			Int("removed", removed).
+			Msg("报价数量/价格在精度修正后被截断，已丢弃部分订单")
+	}
+
+	return filtered
+}
+
+func roundToStep(value, step float64) float64 {
+	if step <= 0 {
+		return value
+	}
+	return math.Round(value/step) * step
+}
+
+func (r *Runner) isEmergencyCooling(symbol string, cooldown time.Duration) bool {
+	r.emergencyMu.Lock()
+	defer r.emergencyMu.Unlock()
+	last, ok := r.lastEmergencyAction[symbol]
+	if !ok {
+		return false
+	}
+	return time.Since(last) < cooldown
+}
+
+func (r *Runner) markEmergency(symbol string) {
+	r.emergencyMu.Lock()
+	defer r.emergencyMu.Unlock()
+	r.lastEmergencyAction[symbol] = time.Now()
+}
+
+func (r *Runner) shouldFallbackReduceOnly(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "ReduceOnly Order is rejected") || strings.Contains(msg, "-2022")
+}
+
+func (r *Runner) getEmergencyLimitPrice(symbol, side string, symCfg *config.SymbolConfig) (float64, bool) {
+	state := r.store.GetSymbolState(symbol)
+	if state == nil || symCfg == nil {
+		return 0, false
+	}
+
+	state.Mu.RLock()
+	bestBid := state.BestBid
+	bestAsk := state.BestAsk
+	mid := state.MidPrice
+	state.Mu.RUnlock()
+
+	tick := symCfg.TickSize
+	if tick <= 0 {
+		tick = 0.01
+	}
+
+	price := 0.0
+	if strings.ToUpper(side) == "SELL" {
+		if bestBid > 0 {
+			price = bestBid - tick*0.5
+			if price <= 0 {
+				price = bestBid
+			}
+		} else if mid > 0 {
+			price = mid * 0.995
+		}
+	} else {
+		if bestAsk > 0 {
+			price = bestAsk + tick*0.5
+		} else if mid > 0 {
+			price = mid * 1.005
+		}
+	}
+
+	if price <= 0 {
+		return 0, false
+	}
+
+	price = math.Round(price/tick) * tick
+	if price <= 0 {
+		price = tick
+	}
+	return price, true
+}
+
+func (r *Runner) trackEmergencyOrder(symbol, clientID, side string, qty float64, orderType string) {
+	if clientID == "" {
+		return
+	}
+
+	r.emergencyMu.Lock()
+	r.emergencyOrders[clientID] = &emergencyOrder{
+		Symbol:    symbol,
+		Side:      side,
+		Quantity:  qty,
+		OrderType: orderType,
+		CreatedAt: time.Now(),
+	}
+	r.emergencyMu.Unlock()
+
+	log.Info().
+		Str("symbol", symbol).
+		Str("side", side).
+		Str("client_id", clientID).
+		Str("type", orderType).
+		Float64("qty", qty).
+		Msg("风控追踪：已记录极限清仓订单")
+}
+
+func (r *Runner) handleEmergencyOrderUpdate(order *gateway.Order) {
+	if order == nil || order.ClientOrderID == "" {
+		return
+	}
+
+	if !(strings.HasPrefix(order.ClientOrderID, "phoenix-guard-") ||
+		strings.HasPrefix(order.ClientOrderID, "phoenix-guard-limit-")) {
+		return
+	}
+
+	r.emergencyMu.Lock()
+	emOrder, ok := r.emergencyOrders[order.ClientOrderID]
+	if !ok {
+		r.emergencyMu.Unlock()
+		log.Warn().
+			Str("symbol", order.Symbol).
+			Str("client_id", order.ClientOrderID).
+			Msg("收到极限风控订单更新，但本地未跟踪该订单")
+		return
+	}
+
+	finalStatus := order.Status == "FILLED" ||
+		order.Status == "CANCELED" ||
+		order.Status == "EXPIRED" ||
+		order.Status == "REJECTED"
+	if finalStatus {
+		delete(r.emergencyOrders, order.ClientOrderID)
+	}
+	r.emergencyMu.Unlock()
+
+	log.Info().
+		Str("symbol", order.Symbol).
+		Str("client_id", order.ClientOrderID).
+		Str("status", order.Status).
+		Str("side", order.Side).
+		Float64("filled", order.FilledQty).
+		Msg("极限风控订单状态更新")
+
+	if finalStatus {
+		if order.Status == "FILLED" {
+			r.markEmergency(order.Symbol)
+			log.Info().
+				Str("symbol", order.Symbol).
+				Str("client_id", order.ClientOrderID).
+				Float64("qty", emOrder.Quantity).
+				Msg("极限风控订单已全部成交，冷却计时重置")
+		} else {
+			r.resetEmergencyCooldown(order.Symbol)
+			log.Warn().
+				Str("symbol", order.Symbol).
+				Str("client_id", order.ClientOrderID).
+				Str("status", order.Status).
+				Msg("极限风控订单未能成交，已清除冷却限制以便重试")
+		}
+	}
+}
+
+func (r *Runner) resetEmergencyCooldown(symbol string) {
+	r.emergencyMu.Lock()
+	delete(r.lastEmergencyAction, symbol)
+	r.emergencyMu.Unlock()
+}
+
 // onDepthUpdate 【P1-1】接收深度更新并发送到channel(非阻塞)
 // 这是WebSocket回调,必须快速返回,不能阻塞
 func (r *Runner) onDepthUpdate(depth *gateway.Depth) {
@@ -724,6 +1179,7 @@ func (r *Runner) onDepthUpdate(depth *gateway.Depth) {
 		// 监控channel使用率
 		channelLen := len(r.depthChan)
 		channelCap := cap(r.depthChan)
+		metrics.UpdateDepthChannelMetrics(channelLen, channelCap)
 		if channelLen > int(float64(channelCap)*DEPTH_CHANNEL_WARNING_PCT) {
 			log.Warn().
 				Str("symbol", depth.Symbol).
@@ -735,10 +1191,12 @@ func (r *Runner) onDepthUpdate(depth *gateway.Depth) {
 
 	default:
 		// Channel满了,丢弃这条消息(背压保护)
-		atomic.AddInt64(&r.depthDropCount, 1)
+		totalDrops := atomic.AddInt64(&r.depthDropCount, 1)
+		channelCap := cap(r.depthChan)
+		metrics.UpdateDepthChannelMetrics(channelCap, channelCap)
 
 		// 每N条丢弃记录一次警告
-		if r.depthDropCount%DEPTH_DROP_LOG_INTERVAL == 1 {
+		if totalDrops%DEPTH_DROP_LOG_INTERVAL == 1 {
 			log.Error().
 				Str("symbol", depth.Symbol).
 				Int64("total_drops", r.depthDropCount).
@@ -747,7 +1205,129 @@ func (r *Runner) onDepthUpdate(depth *gateway.Depth) {
 
 		// 记录到metrics
 		metrics.RecordError("depth_drop", depth.Symbol)
+
+		// 直接兜底刷新mid，避免价格长时间不更新
+		r.handleDepthBackpressure(depth)
 	}
+}
+
+// handleDepthBackpressure 在channel满时执行兜底处理:
+// 1. 直接更新mid避免价格过期
+// 2. 主动丢弃旧消息，释放空间
+func (r *Runner) handleDepthBackpressure(depth *gateway.Depth) {
+	if depth != nil && len(depth.Bids) > 0 && len(depth.Asks) > 0 {
+		bestBid := depth.Bids[0].Price
+		bestAsk := depth.Asks[0].Price
+		mid := (bestBid + bestAsk) / 2.0
+		r.store.UpdateMidPrice(depth.Symbol, mid, bestBid, bestAsk)
+	}
+
+	ch := r.depthChan
+	if ch == nil {
+		return
+	}
+
+	channelCap := cap(ch)
+	if channelCap == 0 {
+		return
+	}
+
+	warningThreshold := int(float64(channelCap) * DEPTH_BACKPRESSURE_PCT)
+	drainTarget := int(float64(channelCap) * DEPTH_DRAIN_TARGET_PCT)
+	if drainTarget < 1 {
+		drainTarget = 1
+	}
+
+	channelLen := len(ch)
+	if channelLen <= warningThreshold {
+		return
+	}
+
+	drained := 0
+	for len(ch) > drainTarget {
+		select {
+		case <-ch:
+			drained++
+		default:
+			break
+		}
+		if len(ch) <= drainTarget {
+			break
+		}
+	}
+
+	if drained > 0 {
+		log.Warn().
+			Str("symbol", depth.Symbol).
+			Int("drained", drained).
+			Int("remaining", len(ch)).
+			Msg("【P1-1】深度channel出现背压，主动丢弃旧消息")
+	}
+
+	metrics.UpdateDepthChannelMetrics(len(ch), channelCap)
+}
+
+func (r *Runner) drainDepthChannel(reason string) int {
+	ch := r.depthChan
+	if ch == nil {
+		return 0
+	}
+
+	drained := 0
+	for {
+		select {
+		case <-ch:
+			drained++
+		default:
+			if drained > 0 {
+				metrics.UpdateDepthChannelMetrics(len(ch), cap(ch))
+				log.Warn().
+					Int("drained", drained).
+					Str("reason", reason).
+					Msg("主动清空深度channel以恢复处理速度")
+			}
+			return drained
+		}
+	}
+}
+
+func (r *Runner) refreshMidPriceFromREST(ctx context.Context, symbol string) {
+	if r.exchange == nil {
+		return
+	}
+
+	childCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	depth, err := r.exchange.GetDepth(childCtx, symbol, 5)
+	if err != nil {
+		log.Warn().
+			Err(err).
+			Str("symbol", symbol).
+			Msg("REST获取深度失败，无法刷新mid")
+		return
+	}
+
+	if depth == nil || len(depth.Bids) == 0 || len(depth.Asks) == 0 {
+		log.Warn().
+			Str("symbol", symbol).
+			Msg("REST深度为空，无法刷新mid")
+		return
+	}
+
+	bestBid := depth.Bids[0].Price
+	bestAsk := depth.Asks[0].Price
+	if bestBid <= 0 || bestAsk <= 0 {
+		return
+	}
+
+	mid := (bestBid + bestAsk) / 2.0
+	r.store.UpdateMidPrice(symbol, mid, bestBid, bestAsk)
+
+	log.Info().
+		Str("symbol", symbol).
+		Float64("mid", mid).
+		Msg("已通过REST深度刷新mid价")
 }
 
 // onOrderUpdate 处理订单更新
@@ -755,6 +1335,8 @@ func (r *Runner) onOrderUpdate(order *gateway.Order) {
 	if order == nil {
 		return
 	}
+
+	r.handleEmergencyOrderUpdate(order)
 
 	log.Info().
 		Str("symbol", order.Symbol).

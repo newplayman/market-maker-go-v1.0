@@ -48,12 +48,24 @@ func (m *mockExchange) CancelAllOrders(ctx context.Context, symbol string) error
 	return nil
 }
 
+func (m *mockExchange) PlaceReduceOnlyMarket(ctx context.Context, symbol, side string, quantity float64) (string, error) {
+	return "mock-guard-market", nil
+}
+
+func (m *mockExchange) PlaceReduceOnlyLimit(ctx context.Context, symbol, side string, quantity, price float64) (string, error) {
+	return "mock-guard-limit", nil
+}
+
 func (m *mockExchange) GetPosition(ctx context.Context, symbol string) (*gateway.Position, error) {
 	return nil, nil
 }
 
 func (m *mockExchange) GetAllPositions(ctx context.Context) ([]*gateway.Position, error) {
 	return nil, nil
+}
+
+func (m *mockExchange) GetAccountBalance(ctx context.Context) (float64, float64, error) {
+	return 0, 0, nil
 }
 
 func (m *mockExchange) GetFundingRate(ctx context.Context, symbol string) (*gateway.FundingRate, error) {
@@ -73,6 +85,18 @@ func (m *mockExchange) StartDepthStream(ctx context.Context, symbols []string, c
 }
 
 func (m *mockExchange) StartUserStream(ctx context.Context, callbacks *gateway.UserStreamCallbacks) error {
+	return nil
+}
+
+func (m *mockExchange) ReconnectStreams(ctx context.Context) error {
+	return nil
+}
+
+func (m *mockExchange) SetLeverage(ctx context.Context, symbol string, leverage int) error {
+	return nil
+}
+
+func (m *mockExchange) SetMarginType(ctx context.Context, symbol string, marginType string) error {
 	return nil
 }
 

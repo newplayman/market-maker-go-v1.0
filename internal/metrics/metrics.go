@@ -1,7 +1,9 @@
 package metrics
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -188,6 +190,14 @@ var (
 		[]string{"symbol"},
 	)
 
+	GridLayerCount = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "phoenix_grid_layer_count",
+			Help: "当前买/卖网格层数",
+		},
+		[]string{"symbol", "side"},
+	)
+
 	InventorySkew = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "phoenix_inventory_skew",
@@ -261,6 +271,20 @@ var (
 		},
 		[]string{"symbol"},
 	)
+
+	DepthChannelLength = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "phoenix_depth_channel_length",
+			Help: "深度消息缓冲队列当前长度",
+		},
+	)
+
+	DepthChannelUsage = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "phoenix_depth_channel_usage",
+			Help: "深度消息缓冲队列使用率（0-1）",
+		},
+	)
 )
 
 func init() {
@@ -287,6 +311,7 @@ func init() {
 		APILatency,
 		ErrorCount,
 		StrategyMode,
+		GridLayerCount,
 		InventorySkew,
 		VolatilityScaling,
 		VPINCurrent,
@@ -296,23 +321,37 @@ func init() {
 		WSBytesReceived,
 		WSMessageCount,
 		WSBandwidthRate,
+		DepthChannelLength,
+		DepthChannelUsage,
 	)
 }
 
-// StartMetricsServer 启动Prometheus监控服务器
-func StartMetricsServer(port int) error {
-	http.Handle("/metrics", promhttp.Handler())
-	addr := fmt.Sprintf(":%d", port)
+// StartMetricsServer 启动Prometheus监控服务器，并返回实际监听端口
+func StartMetricsServer(port int) (int, error) {
+	if port < 0 {
+		port = 0
+	}
 
-	log.Info().Int("port", port).Msg("启动Prometheus监控服务器")
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+
+	addr := fmt.Sprintf(":%d", port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return 0, fmt.Errorf("listen on %s failed: %w", addr, err)
+	}
+
+	actualPort := listener.Addr().(*net.TCPAddr).Port
+
+	log.Info().Int("port", actualPort).Msg("启动Prometheus监控服务器")
 
 	go func() {
-		if err := http.ListenAndServe(addr, nil); err != nil {
+		if err := http.Serve(listener, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error().Err(err).Msg("Prometheus服务器启动失败")
 		}
 	}()
 
-	return nil
+	return actualPort, nil
 }
 
 // RecordFill 记录成交
@@ -356,6 +395,34 @@ func UpdateVPINMetrics(symbol string, vpin float64, bucketCount int, spreadMulti
 // IncrementVPINPauseCount 增加VPIN暂停计数
 func IncrementVPINPauseCount(symbol string) {
 	VPINPauseCount.WithLabelValues(symbol).Inc()
+}
+
+// RecordStrategyMode 更新策略模式
+func RecordStrategyMode(symbol, mode string) {
+	value := 0.0
+	switch mode {
+	case "pinning":
+		value = 1.0
+	case "grinding":
+		value = 2.0
+	default:
+		value = 0.0
+	}
+	StrategyMode.WithLabelValues(symbol).Set(value)
+}
+
+// UpdateGridLayerMetrics 记录当前网格层数
+func UpdateGridLayerMetrics(symbol string, buyLayers, sellLayers int) {
+	GridLayerCount.WithLabelValues(symbol, "buy").Set(float64(buyLayers))
+	GridLayerCount.WithLabelValues(symbol, "sell").Set(float64(sellLayers))
+}
+
+// UpdateDepthChannelMetrics 更新深度队列指标
+func UpdateDepthChannelMetrics(length, capacity int) {
+	DepthChannelLength.Set(float64(length))
+	if capacity > 0 {
+		DepthChannelUsage.Set(float64(length) / float64(capacity))
+	}
 }
 
 // RecordWSMessage 记录WebSocket消息

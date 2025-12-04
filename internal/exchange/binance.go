@@ -9,6 +9,7 @@ const (
 // BinanceREST is a minimal REST client interface; real实现需签名、时间戳等。
 type BinanceREST interface {
 	PlaceLimit(symbol, side, tif string, price, qty float64, reduceOnly, postOnly bool, clientID string) (string, error)
+	PlaceMarket(symbol, side string, qty float64, reduceOnly bool, clientID string) (string, error)
 	CancelOrder(symbol, orderID string) error
 }
 

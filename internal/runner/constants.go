@@ -4,7 +4,7 @@ package runner
 
 const (
 	// WebSocket相关常量
-	STALE_PRICE_THRESHOLD_SECONDS = 5  // 价格数据过期阈值(秒)
+	STALE_PRICE_THRESHOLD_SECONDS = 2  // 价格数据过期阈值(秒)
 	WS_RECONNECT_DELAY_SECONDS    = 2  // WebSocket重连延迟(秒)
 	WS_RECONNECT_MAX_BACKOFF      = 64 // 最大退避时间(秒)
 
@@ -12,6 +12,9 @@ const (
 	DEPTH_CHANNEL_BUFFER_SIZE = 500 // 深度消息channel缓冲大小(从100增加到500)
 	DEPTH_CHANNEL_WARNING_PCT = 0.8 // channel使用率警告阈值(80%)
 	DEPTH_DROP_LOG_INTERVAL   = 100 // 每N条丢弃记录一次日志
+	DEPTH_BACKPRESSURE_PCT    = 0.7 // 达到缓冲70%时触发主动清理
+	DEPTH_DRAIN_TARGET_PCT    = 0.4 // 主动清理时保留40%的最新消息
+	DEPTH_PROCESSOR_WORKERS   = 4   // 并发深度处理worker数量
 
 	// 订单管理相关
 	ORDER_OVERFLOW_THRESHOLD = 50   // 订单溢出熔断阈值

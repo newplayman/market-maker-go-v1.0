@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/newplayman/market-maker-phoenix/internal/config"
+	"github.com/newplayman/market-maker-phoenix/internal/metrics"
 	"github.com/newplayman/market-maker-phoenix/internal/store"
 	"github.com/rs/zerolog/log"
 )
@@ -170,6 +171,52 @@ func (a *ASMM) GenerateQuotes(ctx context.Context, symbol string) ([]Quote, []Qu
 		// 正常模式：生成多层报价
 		mode = "normal"
 		buyQuotes, sellQuotes = a.generateNormalQuotes(reservation, spread, symCfg)
+	}
+
+	metrics.RecordStrategyMode(symbol, mode)
+
+	// 【统一精度修正】确保所有报价的数量和价格都符合交易所要求
+	// 修复：generateNormalQuotes等函数可能未正确处理UnifiedLayerSize的精度
+	for i := range buyQuotes {
+		buyQuotes[i].Size = a.roundQty(buyQuotes[i].Size, symCfg.MinQty)
+		buyQuotes[i].Price = a.roundPrice(buyQuotes[i].Price, symCfg.TickSize)
+	}
+	for i := range sellQuotes {
+		sellQuotes[i].Size = a.roundQty(sellQuotes[i].Size, symCfg.MinQty)
+		sellQuotes[i].Price = a.roundPrice(sellQuotes[i].Price, symCfg.TickSize)
+	}
+
+	// 【关键修复】Post Only保护：确保报价不吃单
+	// 如果报价跨越了买一/卖一价，会导致Post Only订单被拒
+	// 因此需要将价格限制在对手价之内（Maker）
+	if bestAsk > 0 && bestBid > 0 {
+		// 买单价格不能 >= BestAsk
+		// 为了安全，限制在 BestAsk - TickSize
+		maxBuyPrice := bestAsk - symCfg.TickSize
+		for i := range buyQuotes {
+			if buyQuotes[i].Price > maxBuyPrice {
+				// log.Debug().
+				// 	Str("symbol", symbol).
+				// 	Float64("original", buyQuotes[i].Price).
+				// 	Float64("clamped", maxBuyPrice).
+				// 	Msg("买单价格触及对手价，触发Post Only保护钳位")
+				buyQuotes[i].Price = maxBuyPrice
+			}
+		}
+
+		// 卖单价格不能 <= BestBid
+		// 为了安全，限制在 BestBid + TickSize
+		minSellPrice := bestBid + symCfg.TickSize
+		for i := range sellQuotes {
+			if sellQuotes[i].Price < minSellPrice {
+				// log.Debug().
+				// 	Str("symbol", symbol).
+				// 	Float64("original", sellQuotes[i].Price).
+				// 	Float64("clamped", minSellPrice).
+				// 	Msg("卖单价格触及对手价，触发Post Only保护钳位")
+				sellQuotes[i].Price = minSellPrice
+			}
+		}
 	}
 
 	// 记录模式切换（仅在模式变化时记录）

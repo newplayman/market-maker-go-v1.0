@@ -18,12 +18,13 @@ global:
 symbols:
   - symbol: "BTCUSDT"
     net_max: 1.0
+    base_layer_size: 0.01
     min_qty: 0.001
     min_spread: 0.0002
+    stop_loss_thresh: 0.05
     near_layers: 3
     far_layers: 5
     max_cancel_per_min: 50
-    stop_loss_thresh: 0.01
     grinding_enabled: true
     grinding_thresh: 0.8
 `
